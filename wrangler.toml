@@ -6,7 +6,7 @@ compatibility_flags = ["nodejs_compat"]
 [[d1_databases]]
 binding = "DB"
 database_name = "cubagest-db"
-database_id = "TU_DATABASE_ID"
+database_id = "067cfeb9-8fd8-4dd1-a201-5f874db9977a"
 
 [vars]
 ENVIRONMENT = "production"
