@@ -11,6 +11,22 @@ database_id = "067cfeb9-8fd8-4dd1-a201-5f874db9977a"
 [vars]
 ENVIRONMENT = "production"
 
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1
+
+
 # Secrets (no poner valores aqui, usar wrangler secret put):
 # JWT_SECRET
 # QVAPAY_APP_ID
