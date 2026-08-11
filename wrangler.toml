@@ -12,7 +12,7 @@ database_id = "067cfeb9-8fd8-4dd1-a201-5f874db9977a"
 ENVIRONMENT = "production"
 
 [observability]
-enabled = false
+enabled = true
 head_sampling_rate = 1
 
 [observability.logs]
