@@ -1,0 +1,19 @@
+name = "cubagest-backend"
+main = "src/index.ts"
+compatibility_date = "2024-06-20"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "cubagest-db"
+database_id = "REEMPLAZAR_TRAS_CREAR_EN_DASHBOARD"
+
+[vars]
+ENVIRONMENT = "production"
+
+# Secrets (no poner valores aqui, usar wrangler secret put):
+# JWT_SECRET
+# QVAPAY_APP_ID
+# QVAPAY_APP_SECRET
+# QVAPAY_CALLBACK_URL
+# APP_URL

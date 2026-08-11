@@ -1,0 +1,1 @@
+interface Env {  DB: D1Database;  JWT_SECRET: string;  ENVIRONMENT: string;  QVAPAY_APP_ID?: string;  QVAPAY_APP_SECRET?: string;  QVAPAY_CALLBACK_URL?: string;  APP_URL?: string;}

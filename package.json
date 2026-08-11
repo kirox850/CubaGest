@@ -1,0 +1,24 @@
+{
+  "name": "cubagest-backend",
+  "version": "2.0.0",
+  "description": "Backend API para CubaGest - ERP multiempresa en Cloudflare Workers + Hono + Drizzle + D1",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "wrangler d1 migrations apply cubagest-db",
+    "db:migrate:local": "wrangler d1 migrations apply cubagest-db --local",
+    "db:studio": "drizzle-kit studio"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.30.0",
+    "hono": "^4.4.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240620.0",
+    "drizzle-kit": "^0.22.0",
+    "typescript": "^5.5.0",
+    "wrangler": "^3.60.0"
+  }
+}
