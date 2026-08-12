@@ -11,6 +11,11 @@ database_id = "067cfeb9-8fd8-4dd1-a201-5f874db9977a"
 [vars]
 ENVIRONMENT = "production"
 
+[triggers]
+# Corre todos los días a las 06:00 UTC (02:00 en Cuba) y cobra las
+# suscripciones QvaPay con nextPaymentDate vencido.
+crons = ["0 6 * * *"]
+
 [observability]
 enabled = true
 head_sampling_rate = 1
