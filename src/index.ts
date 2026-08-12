@@ -8,7 +8,7 @@ import sync from "./routes/sync";      // FIX: sync antes que sales
 import sales from "./routes/sales";    // FIX: sales después de sync
 import invoices from "./routes/invoices";
 import accounting from "./routes/accounting";
-import subscriptions from "./routes/subscriptions";
+import subscriptions, { renewQvapaySubscriptions } from "./routes/subscriptions";
 import dashboard from "./routes/dashboard";
 import closing from "./routes/closing";
 
@@ -42,4 +42,12 @@ app.onError((err, c) => {
   return c.json({ ok: false, error: "Error interno del servidor" }, 500);
 });
 
-export default app;
+export default {
+  fetch: app.fetch,
+
+  // Cron trigger (ver [triggers] en wrangler.toml): cobra automáticamente
+  // las suscripciones QvaPay cuyo próximo pago ya venció.
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
+    ctx.waitUntil(renewQvapaySubscriptions(env));
+  },
+};
