@@ -11,6 +11,13 @@ const PLAN_LIMITS: Record<string, { maxUsers: number | null; maxProducts: number
 
 export { PLAN_LIMITS };
 
+// Precios en USD para cobro con QvaPay (deben coincidir con los mostrados en el frontend)
+export const PLAN_PRICES: Record<string, number> = {
+  free: 0,
+  pro: 5,
+  empresarial: 10,
+};
+
 function getEffectivePlan(company: typeof schema.companies.$inferSelect): string {
   if (company.planExpiry && new Date(company.planExpiry) < new Date()) {
     return "free";
