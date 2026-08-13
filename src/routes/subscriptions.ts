@@ -87,7 +87,14 @@ subscriptions.post("/authorize", authMiddleware, requireRole("admin"), async (c)
   }
 
   const remoteId = `${auth.companyId}:${plan}`;
-  const callbackUrl = `${new URL(c.req.url).origin}/subscription/qvapay-callback`;
+  // El callback pasa por el proxy del frontend (/api/...), NO por la URL
+  // directa de workers.dev — en Cuba ese dominio está bloqueado por el ISP,
+  // así que si QvaPay redirigiera al navegador directo a workers.dev, la
+  // redirección se quedaría colgada igual que las llamadas normales de la
+  // API. El proxy en functions/api/[[path]].ts reenvía esto al backend real
+  // por dentro de la red de Cloudflare.
+  const frontendUrl = c.env.APP_URL || "https://cubagest.dpdns.org";
+  const callbackUrl = `${frontendUrl}/api/subscription/qvapay-callback`;
 
   try {
     const result = await qvapayAuthorizePayments(c.env, remoteId, callbackUrl);
