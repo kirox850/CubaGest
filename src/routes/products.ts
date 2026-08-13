@@ -3,7 +3,7 @@ import { eq, and, like, or } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import * as schema from "../db/schema";
 import { authMiddleware } from "../middleware/auth";
-import { requireModule } from "../middleware/roles";
+import { requireModule, requireAnyModule } from "../middleware/roles";
 import { checkLimit } from "../middleware/plans";
 import { generateUUID } from "../lib/jwt";
 
@@ -11,7 +11,9 @@ const products = new Hono<{ Bindings: Env }>();
 
 products.use("*", authMiddleware);
 
-products.get("/", requireModule("inventario"), async (c) => {
+// Leer el catálogo lo necesita cualquier módulo que venda o facture
+// productos, no solo quien administra el inventario.
+products.get("/", requireAnyModule("inventario", "pos", "facturacion"), async (c) => {
   const db = drizzle(c.env.DB, { schema });
   const auth = c.get("auth");
   const { search, category } = c.req.query();
