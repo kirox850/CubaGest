@@ -20,6 +20,21 @@ export function requireModule(moduleName: string) {
   });
 }
 
+// Como requireModule, pero pasa si el rol tiene AL MENOS UNO de los módulos
+// dados. Útil para endpoints de solo-lectura que varios módulos necesitan
+// (ej. leer el catálogo de productos lo necesitan tanto "inventario" como
+// "pos" y "facturacion", aunque solo "inventario" pueda editarlo).
+export function requireAnyModule(...moduleNames: string[]) {
+  return createMiddleware<{ Bindings: Env }>(async (c, next) => {
+    const role = c.get("auth")?.role;
+    const perms = ROLES[role]?.perms || [];
+    if (!moduleNames.some(m => perms.includes(m))) {
+      return c.json({ ok: false, error: "No tiene permisos para acceder a este módulo" }, 403);
+    }
+    await next();
+  });
+}
+
 export function requireRole(...allowedRoles: string[]) {
   return createMiddleware<{ Bindings: Env }>(async (c, next) => {
     const role = c.get("auth")?.role;
