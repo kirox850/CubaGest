@@ -47,6 +47,11 @@ export async function qvapayAuthorizePayments(env: Env, remoteId: string, callba
 
 // POST /v2/charge
 // Cobra directamente el balance de un usuario que ya autorizó pagos a la app.
+//
+// Confirmado con la documentación oficial (qvapay.com/docs/merchants/charge):
+// el request solo lleva amount, user_uuid, description y remote_id. NO hay
+// campo "token" — la suposición anterior de mandar el auth_secret como
+// "token" venía de un SDK no oficial y no coincide con la doc real.
 export async function qvapayCharge(
   env: Env,
   params: { amount: number; userUuid: string; description: string; remoteId: string }
@@ -61,6 +66,54 @@ export async function qvapayCharge(
     message: string;
     transaction: { uuid: string; amount: number; description: string; remote_id: string; status: string };
   }>;
+}
+
+// Verifica (sin bloquear) que el callback de authorize_payments venga
+// firmado como esperamos. La documentación oficial de QvaPay NO detalla el
+// formato del callback (data/token) ni cómo validarlo — lo que sabemos es
+// solo lo observado en producción (data en Base64, token de 64 hex, que
+// tiene pinta de HMAC-SHA256). Como no está confirmado por soporte/doc,
+// esta función NO debe usarse para rechazar el callback todavía: solo para
+// loguear si coincide, y así juntar evidencia antes de convertirlo en un
+// bloqueo real. Si en varias pruebas reales el hash siempre coincide,
+// entonces sí conviene endurecerlo a rechazo.
+export async function qvapayComputeHmac(appSecret: string, data: string): Promise<string> {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(appSecret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const signatureBuffer = await crypto.subtle.sign("HMAC", key, enc.encode(data));
+  return Array.from(new Uint8Array(signatureBuffer))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+// Decodifica el payload `data` (Base64 -> JSON) que manda QvaPay en el
+// callback de authorize_payments. Confirmado con una autorización real:
+// contiene remote_id, user_uuid, user_email, user_name, verified y
+// auth_secret. auth_secret NO es necesario para /v2/charge según la doc
+// oficial (que solo pide user_uuid) — lo guardamos igual por si acaso, pero
+// no se usa en el cobro.
+export interface QvaPayCallbackData {
+  remote_id?: string;
+  user_uuid?: string;
+  user_email?: string;
+  user_name?: string;
+  verified?: boolean;
+  auth_secret?: string;
+}
+
+export function decodeQvapayCallbackData(dataB64: string): QvaPayCallbackData | null {
+  try {
+    const decoded = atob(dataB64);
+    return JSON.parse(decoded) as QvaPayCallbackData;
+  } catch {
+    return null;
+  }
 }
 
 export { QvaPayError };
