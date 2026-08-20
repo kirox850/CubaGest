@@ -5,7 +5,13 @@ import * as schema from "../db/schema";
 import { authMiddleware } from "../middleware/auth";
 import { requireRole } from "../middleware/roles";
 import { PLAN_LIMITS, PLAN_PRICES, getPlanInfo } from "../middleware/plans";
-import { qvapayAuthorizePayments, qvapayCharge, QvaPayError } from "../lib/qvapay";
+import {
+  qvapayAuthorizePayments,
+  qvapayCharge,
+  qvapayComputeHmac,
+  decodeQvapayCallbackData,
+  QvaPayError,
+} from "../lib/qvapay";
 
 const subscriptions = new Hono<{ Bindings: Env }>();
 
@@ -109,28 +115,48 @@ subscriptions.post("/authorize", authMiddleware, requireRole("admin"), async (c)
 // QvaPay redirige aquí el navegador del usuario luego de autorizar (o
 // cancelar) los cobros recurrentes. Esta ruta NO lleva authMiddleware:
 // es una redirección de navegador sin el token de sesión de CubaGest, así
-// que identificamos la empresa/plan a través de remote_id (que nosotros
-// mismos generamos en /authorize).
+// que identificamos la empresa/plan a través de remote_id.
 //
-// ⚠️ IMPORTANTE: la documentación pública de QvaPay no detalla con qué
-// query params exactos vuelve esta redirección más allá del flujo general
-// (ver https://www.qvapay.com/docs/merchants/authorize-payments). Este
-// código intenta varios nombres razonables para el UUID del usuario
-// autorizado (user_uuid, uuid, authorized_uuid) y registra el query string
-// completo en los logs de Cloudflare para poder ajustar el nombre exacto
-// del campo la primera vez que se pruebe en producción.
+// Confirmado con una autorización real en producción (agosto 2026): QvaPay
+// NO manda el uuid como query param plano. Manda tres params:
+//   - data: JSON en Base64 con { remote_id, user_uuid, user_email,
+//     user_name, verified, auth_secret }
+//   - token: hex de 64 caracteres, pinta de HMAC-SHA256(app_secret, data)
+//   - remote_id: el mismo remote_id, repetido fuera del data.
+// ⚠️ La doc oficial de QvaPay (qvapay.com/docs) NO documenta este formato
+// de callback ni cómo verificar `token`, así que NO lo usamos para
+// bloquear el callback (podría rechazar callbacks legítimos si el
+// algoritmo real es distinto al que asumimos). Solo lo logueamos para
+// comparar y confirmar con casos reales antes de endurecerlo a un rechazo.
+//
+// Para el cobro (/v2/charge) la doc oficial confirma que solo hace falta
+// user_uuid — el auth_secret del payload se guarda por si acaso, pero no
+// se usa en el cobro.
 subscriptions.get("/qvapay-callback", async (c) => {
   const db = drizzle(c.env.DB, { schema });
   const query = c.req.query();
   const frontendUrl = c.env.APP_URL || "https://cubagest.dpdns.org";
 
-  console.log("QvaPay callback recibido:", JSON.stringify(query));
+  console.log("QvaPay callback recibido, remote_id:", query.remote_id, "tiene data:", !!query.data, "tiene token:", !!query.token);
 
-  const remoteId = query.remote_id || "";
-  const [companyId, plan] = remoteId.split(":");
+  // Verificación NO bloqueante: solo para ir confirmando si nuestra
+  // suposición del algoritmo (HMAC-SHA256) es correcta, comparando en los
+  // logs. Cuando se confirme en varias pruebas reales, se puede convertir
+  // en un rechazo real.
+  if (query.data && query.token && c.env.QVAPAY_APP_SECRET) {
+    try {
+      const computed = await qvapayComputeHmac(c.env.QVAPAY_APP_SECRET, query.data);
+      console.log("QvaPay callback: hash calculado coincide con token recibido:", computed === query.token);
+    } catch (e) {
+      console.error("QvaPay callback: no se pudo calcular el hash de verificación:", e);
+    }
+  }
+
+  const remoteIdRaw = query.remote_id || "";
+  const [companyId, plan] = remoteIdRaw.split(":");
 
   if (!companyId || (plan !== "pro" && plan !== "empresarial")) {
-    console.error("QvaPay callback sin remote_id válido:", remoteId);
+    console.error("QvaPay callback sin remote_id válido:", remoteIdRaw);
     return c.redirect(`${frontendUrl}/?qvapay=error`, 302);
   }
 
@@ -141,27 +167,29 @@ subscriptions.get("/qvapay-callback", async (c) => {
   const company = await db.select().from(schema.companies).where(eq(schema.companies.id, companyId)).get();
   if (!company) return c.redirect(`${frontendUrl}/?qvapay=error`, 302);
 
-  const userUuid = query.user_uuid || query.uuid || query.authorized_uuid || company.qvapayUserUuid || null;
+  if (!query.data) {
+    console.error("QvaPay callback sin `data`, no se puede procesar la autorización");
+    return c.redirect(`${frontendUrl}/?qvapay=error`, 302);
+  }
+
+  const payload = decodeQvapayCallbackData(query.data);
+  if (!payload || !payload.user_uuid) {
+    console.error("QvaPay callback con data decodificable pero sin user_uuid");
+    return c.redirect(`${frontendUrl}/?qvapay=authorized&pending=1`, 302);
+  }
 
   await db.update(schema.companies).set({
     paymentMethod: "qvapay",
     qvapayAuthorized: true,
-    qvapayUserUuid: userUuid,
+    qvapayUserUuid: payload.user_uuid,
+    qvapayAuthSecret: payload.auth_secret || null,
   }).where(eq(schema.companies.id, companyId));
-
-  // Si QvaPay no nos mandó el UUID del usuario en este callback, quedamos
-  // autorizados pero no podemos cobrar todavía — hace falta revisar los
-  // logs para ver el nombre real del campo y ajustar la lista de arriba.
-  if (!userUuid) {
-    console.error("QvaPay callback autorizado pero sin user_uuid reconocible:", JSON.stringify(query));
-    return c.redirect(`${frontendUrl}/?qvapay=authorized&pending=1`, 302);
-  }
 
   const amount = PLAN_PRICES[plan];
   try {
     await qvapayCharge(c.env, {
       amount,
-      userUuid,
+      userUuid: payload.user_uuid,
       description: `CubaGest — Plan ${plan === "pro" ? "Pro" : "Empresarial"} (mensual)`,
       remoteId: `${companyId}:${plan}:${Date.now()}`,
     });
