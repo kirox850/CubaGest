@@ -12,6 +12,12 @@ export const companies = sqliteTable("companies", {
   subscriptionStatus: text("subscription_status", { enum: ["trial", "active", "failed", "cancelled", "none"] }).notNull().default("trial"),
   paymentMethod: text("payment_method", { enum: ["qvapay", "whatsapp"] }),
   qvapayUserUuid: text("qvapay_user_uuid"),
+  // Token de autorización devuelto por QvaPay tras el authorize_payments
+  // (campo "auth_secret" del payload del callback). Es lo que hay que
+  // reenviar en cada /v2/charge — el user_uuid solo no basta para cobrar,
+  // ver documentación del SDK oficial de QvaPay (charge_user(token=...)).
+  // NUNCA loguear este valor.
+  qvapayAuthSecret: text("qvapay_auth_secret"),
   qvapayAuthorized: integer("qvapay_authorized", { mode: "boolean" }).notNull().default(false),
   lastPaymentDate: integer("last_payment_date", { mode: "timestamp" }),
   nextPaymentDate: integer("next_payment_date", { mode: "timestamp" }),
