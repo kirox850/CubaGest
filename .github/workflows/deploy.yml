@@ -1,36 +1,51 @@
-name: Deploy to Cloudflare Workers
+name: Deploy CubaGest Backend
 
+# Corre en cada push a main (o manualmente desde la pestaña Actions con
+# "Run workflow"). Si en el futuro este repo tiene más carpetas y quieres
+# que solo dispare cuando cambia el backend, se puede acotar con `paths:`
+# — lo dejo sin acotar porque hoy el repo es solo el backend.
 on:
   push:
     branches: [main]
-  workflow_dispatch:
+  workflow_dispatch: {}
+
+# Evita que dos deploys corran en paralelo si haces push varias veces
+# seguidas — el segundo cancela al primero en vez de pisarse con él.
+concurrency:
+  group: deploy-cubagest-backend
+  cancel-in-progress: true
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Descargar el código
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Instalar Node
+        uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: "20"
+          cache: "npm"
 
-      - name: Install dependencies with wrangler v4
-        run: npm install && npm install --save-dev wrangler@4
+      - name: Instalar dependencias
+        run: npm ci
 
-      - name: Run migrations
+      - name: Verificar tipos (tsc)
+        run: npx tsc --noEmit
+
+      # --remote es obligatorio en Wrangler v3: sin él, el comando aplica la
+      # migración contra una base local que no persiste entre corridas de
+      # CI y nunca toca la base real (esto fue justo lo que pasó hoy — la
+      # migración de qvapay_auth_secret nunca llegó a producción). El
+      # script db:migrate en package.json ya quedó corregido con --remote.
+      - name: Aplicar migraciones de D1 en producción
         run: npm run db:migrate
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
-      - name: Set JWT_SECRET
-        run: echo "${{ secrets.JWT_SECRET }}" | npx wrangler secret put JWT_SECRET
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-
-      - name: Deploy Worker
+      - name: Desplegar el Worker
         run: npm run deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
