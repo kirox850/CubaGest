@@ -22,14 +22,14 @@ jobs:
       - name: Descargar el código
         uses: actions/checkout@v4
 
+      - name: Instalar dependencias
+        run: npm install
+        
       - name: Instalar Node
         uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: "npm"
-
-      - name: Instalar dependencias
-        run: npm install
 
       - name: Verificar tipos (tsc)
         run: npx tsc --noEmit
