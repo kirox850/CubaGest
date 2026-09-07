@@ -50,6 +50,11 @@ export const products = sqliteTable("products", {
   unit: text("unit").notNull().default("ud"),
   price: real("price").notNull(),
   cost: real("cost").notNull().default(0),
+  // Stock TOTAL de la empresa (suma de todas las ubicaciones) — se recalcula
+  // automáticamente cada vez que cambia location_stock. Sirve para el
+  // dashboard/alertas de stock bajo a nivel de empresa, pero NUNCA se usa
+  // para vender ni para descontar directamente: eso siempre pasa por
+  // location_stock (ver inventoryLocations/locationStock más abajo).
   stock: real("stock").notNull().default(0),
   minStock: real("min_stock").notNull().default(0),
   active: integer("active", { mode: "boolean" }).notNull().default(true),
@@ -60,11 +65,80 @@ export const products = sqliteTable("products", {
   codeIdx: uniqueIndex("products_code_idx").on(table.companyId, table.code),
 }));
 
+// ── Inventario multi-ubicación ───────────────────────────────────────────────
+// Cada empresa tiene UN almacén central ("almacen") y, opcionalmente, una
+// "caja" por cada usuario cajero — su inventario personal e independiente.
+// El stock real y operativo vive en locationStock, no en products.stock.
+export const inventoryLocations = sqliteTable("inventory_locations", {
+  id: text("id").primaryKey(),
+  companyId: text("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  type: text("type", { enum: ["almacen", "caja"] }).notNull(),
+  // Dueño de la ubicación. NULL para el almacén (es de la empresa, no de una
+  // persona). Para una "caja" es el cajero dueño de ese inventario/caja.
+  ownerUserId: text("owner_user_id").references(() => users.id, { onDelete: "set null" }),
+  active: integer("active", { mode: "boolean" }).notNull().default(true),
+  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+}, (table) => ({
+  companyIdx: index("locations_company_idx").on(table.companyId),
+  ownerIdx: index("locations_owner_idx").on(table.ownerUserId),
+}));
+
+export const locationStock = sqliteTable("location_stock", {
+  id: text("id").primaryKey(),
+  locationId: text("location_id").notNull().references(() => inventoryLocations.id, { onDelete: "cascade" }),
+  productId: text("product_id").notNull().references(() => products.id, { onDelete: "cascade" }),
+  qty: real("qty").notNull().default(0),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+}, (table) => ({
+  locationIdx: index("location_stock_location_idx").on(table.locationId),
+  productIdx: index("location_stock_product_idx").on(table.productId),
+  uniqueLocationProduct: uniqueIndex("location_stock_unique_idx").on(table.locationId, table.productId),
+}));
+
+// Envío de productos entre dos ubicaciones. El stock se descuenta del
+// origen SOLO cuando el destino aprueba — mientras está "pendiente" sigue
+// disponible normalmente en el origen (se puede vender/usar/cancelar sin
+// problema). Si se rechaza, no hay que revertir nada porque nunca se movió.
+export const stockTransfers = sqliteTable("stock_transfers", {
+  id: text("id").primaryKey(),
+  companyId: text("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
+  fromLocationId: text("from_location_id").notNull().references(() => inventoryLocations.id),
+  toLocationId: text("to_location_id").notNull().references(() => inventoryLocations.id),
+  requestedById: text("requested_by_id").notNull().references(() => users.id),
+  resolvedById: text("resolved_by_id").references(() => users.id),
+  status: text("status", { enum: ["pendiente", "aprobado", "rechazado", "cancelado"] }).notNull().default("pendiente"),
+  notes: text("notes"),
+  rejectReason: text("reject_reason"),
+  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+  resolvedAt: integer("resolved_at", { mode: "timestamp" }),
+}, (table) => ({
+  companyIdx: index("transfers_company_idx").on(table.companyId),
+  fromIdx: index("transfers_from_idx").on(table.fromLocationId),
+  toIdx: index("transfers_to_idx").on(table.toLocationId),
+  statusIdx: index("transfers_status_idx").on(table.status),
+}));
+
+export const stockTransferItems = sqliteTable("stock_transfer_items", {
+  id: text("id").primaryKey(),
+  transferId: text("transfer_id").notNull().references(() => stockTransfers.id, { onDelete: "cascade" }),
+  productId: text("product_id").notNull().references(() => products.id),
+  productCode: text("product_code").notNull(),
+  productName: text("product_name").notNull(),
+  unit: text("unit").notNull(),
+  qty: real("qty").notNull(),
+}, (table) => ({
+  transferIdx: index("transfer_items_transfer_idx").on(table.transferId),
+}));
+
 export const sales = sqliteTable("sales", {
   id: text("id").primaryKey(),
   companyId: text("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
   invoiceNumber: text("invoice_number").notNull(),
   userId: text("user_id").notNull().references(() => users.id, { onDelete: "set null" }),
+  // Ubicación (caja) donde se hizo la venta — de aquí se descuenta el stock
+  // y por aquí se filtra el cierre de caja de cada cajero independientemente.
+  locationId: text("location_id").references(() => inventoryLocations.id, { onDelete: "set null" }),
   date: text("date").notNull(),
   clientName: text("client_name").notNull().default("Consumidor Final"),
   clientNit: text("client_nit"),
@@ -126,6 +200,10 @@ export const stockMovements = sqliteTable("stock_movements", {
 export const inventoryReadings = sqliteTable("inventory_readings", {
   id: text("id").primaryKey(),
   companyId: text("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
+  // Ubicación a la que pertenece esta lectura — antes era "toda la empresa"
+  // como si fuera un solo inventario; ahora cada caja (y el almacén) llevan
+  // su propia lectura/cierre independiente.
+  locationId: text("location_id").notNull().references(() => inventoryLocations.id, { onDelete: "cascade" }),
   takenById: text("taken_by_id").notNull().references(() => users.id, { onDelete: "cascade" }),
   type: text("type", { enum: ["apertura", "cierre"] }).notNull(),
   notes: text("notes"),
@@ -136,6 +214,7 @@ export const inventoryReadings = sqliteTable("inventory_readings", {
 export const cashClosings = sqliteTable("cash_closings", {
   id: text("id").primaryKey(),
   companyId: text("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
+  locationId: text("location_id").notNull().references(() => inventoryLocations.id, { onDelete: "cascade" }),
   closedById: text("closed_by_id").notNull().references(() => users.id, { onDelete: "cascade" }),
   initialReadingId: text("initial_reading_id").notNull().references(() => inventoryReadings.id),
   closingReadingId: text("closing_reading_id").references(() => inventoryReadings.id),
