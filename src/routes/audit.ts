@@ -1,48 +1,50 @@
+import { Hono } from "hono";
+import { eq, and, desc, like } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import * as schema from "../db/schema";
-import { generateUUID } from "./jwt";
+import { authMiddleware } from "../middleware/auth";
+import { requireRole } from "../middleware/roles";
 
-// Trazabilidad completa: cualquier acción que cambie datos (crear, editar,
-// borrar, aprobar, ajustar stock, etc.) queda registrada acá. Pensado para
-// la pestaña de Auditoría (solo admin) — nunca se borra ni se edita.
-//
-// No usar para lecturas (GET) ni para cosas que ya quedan registradas por sí
-// solas con suficiente detalle (ej. una venta ya crea su propia fila en
-// `sales`) — logAudit es para el "quién hizo qué y cuándo" que de otra forma
-// se pierde, como ediciones de stock, aprobaciones de transferencias, o
-// cambios de rol de un usuario.
-export async function logAudit(
-  env: Env,
-  params: {
-    companyId: string;
-    userId: string | null;
-    action: string;    // ej. "product.adjust_stock", "transfer.approve", "user.role_change"
-    entity: string;    // ej. "product", "transfer", "user"
-    entityId?: string | null;
-    detail?: Record<string, unknown> | string | null;
-    ip?: string | null;
-  }
-): Promise<void> {
-  try {
-    const db = drizzle(env.DB, { schema });
-    await db.insert(schema.auditLogs).values({
-      id: generateUUID(),
-      companyId: params.companyId,
-      userId: params.userId,
-      action: params.action,
-      entity: params.entity,
-      entityId: params.entityId ?? null,
-      detail: typeof params.detail === "string" ? params.detail : params.detail ? JSON.stringify(params.detail) : null,
-      ip: params.ip ?? null,
-    });
-  } catch (err) {
-    // La auditoría nunca debe tumbar la operación principal — si falla el
-    // log, solo lo dejamos en consola del Worker.
-    console.error("No se pudo registrar en auditoría:", err);
-  }
-}
+const audit = new Hono<{ Bindings: Env }>();
 
-// Extrae la IP del request de forma consistente (Cloudflare la manda en este header).
-export function getClientIp(c: { req: { header: (name: string) => string | undefined } }): string | null {
-  return c.req.header("cf-connecting-ip") || c.req.header("x-real-ip") || null;
-}
+audit.use("*", authMiddleware);
+
+// GET /audit — solo admin. Filtros opcionales: entity, action (coincidencia
+// parcial), userId. Paginado simple con limit/offset.
+audit.get("/", requireRole("admin"), async (c) => {
+  const db = drizzle(c.env.DB, { schema });
+  const auth = c.get("auth");
+  const { entity, action, userId, limit, offset } = c.req.query();
+
+  const conditions: any[] = [eq(schema.auditLogs.companyId, auth.companyId)];
+  if (entity) conditions.push(eq(schema.auditLogs.entity, entity));
+  if (action) conditions.push(like(schema.auditLogs.action, `%${action}%`));
+  if (userId) conditions.push(eq(schema.auditLogs.userId, userId));
+
+  const take = Math.min(Number(limit) || 100, 500);
+  const skip = Number(offset) || 0;
+
+  const rows = await db.select().from(schema.auditLogs)
+    .where(and(...conditions))
+    .orderBy(desc(schema.auditLogs.createdAt))
+    .limit(take).offset(skip).all();
+
+  // Adjuntar nombre del usuario para no obligar al frontend a cruzarlo.
+  const userIds = Array.from(new Set(rows.map(r => r.userId).filter(Boolean))) as string[];
+  const usersMap: Record<string, string> = {};
+  if (userIds.length > 0) {
+    const users = await db.select({ id: schema.users.id, name: schema.users.name }).from(schema.users)
+      .where(eq(schema.users.companyId, auth.companyId)).all();
+    for (const u of users) usersMap[u.id] = u.name;
+  }
+
+  const result = rows.map(r => ({
+    ...r,
+    userName: r.userId ? (usersMap[r.userId] || "Usuario eliminado") : "Sistema",
+    detail: (() => { try { return r.detail ? JSON.parse(r.detail) : null; } catch { return r.detail; } })(),
+  }));
+
+  return c.json({ ok: true, data: result });
+});
+
+export default audit;
