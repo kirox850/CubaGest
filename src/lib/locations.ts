@@ -1,148 +1,131 @@
+import { Hono } from "hono";
 import { eq, and } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import * as schema from "../db/schema";
-import { generateUUID } from "./jwt";
-import type { AuthContext } from "../middleware/auth";
+import { authMiddleware } from "../middleware/auth";
+import { generateUUID } from "../lib/jwt";
+import { logAudit, getClientIp } from "../lib/audit";
+import { adjustLocationStock, getLocationStockQty } from "../lib/locations";
 
-type DB = ReturnType<typeof drizzle>;
+const locations = new Hono<{ Bindings: Env }>();
 
-export async function getAlmacenLocation(db: DB, companyId: string) {
-  return db.select().from(schema.inventoryLocations)
-    .where(and(eq(schema.inventoryLocations.companyId, companyId), eq(schema.inventoryLocations.type, "almacen")))
-    .get();
+locations.use("*", authMiddleware);
+
+// Devuelve true si el usuario puede ver/operar la ubicación dada:
+// admin siempre; almacenista solo el almacén; cajero solo su propia caja.
+async function canAccessLocation(db: ReturnType<typeof drizzle>, auth: any, location: typeof schema.inventoryLocations.$inferSelect) {
+  if (auth.role === "admin") return true;
+  if (auth.role === "almacenista") return location.type === "almacen";
+  if (auth.role === "cajero") return location.type === "caja" && location.ownerUserId === auth.userId;
+  return false;
 }
 
-export async function getCajaLocationForUser(db: DB, companyId: string, userId: string) {
-  return db.select().from(schema.inventoryLocations)
-    .where(and(
-      eq(schema.inventoryLocations.companyId, companyId),
-      eq(schema.inventoryLocations.ownerUserId, userId),
-      eq(schema.inventoryLocations.type, "caja"),
-    ))
-    .get();
-}
+// GET /locations — metadata básica (id, nombre, tipo) de TODAS las
+// ubicaciones de la empresa, visible para cualquier usuario autenticado —
+// es lo que se necesita para elegir un destino al crear un envío. El STOCK
+// de cada ubicación es lo que de verdad está restringido (ver /:id/stock).
+locations.get("/", async (c) => {
+  const db = drizzle(c.env.DB, { schema });
+  const auth = c.get("auth");
+  const rows = await db.select().from(schema.inventoryLocations)
+    .where(eq(schema.inventoryLocations.companyId, auth.companyId)).all();
+  return c.json({ ok: true, data: rows });
+});
 
-// "Mi propia ubicación" según el rol de quien hace la petición.
-// admin NO tiene una ubicación propia fija — para acciones sobre una
-// ubicación concreta, el admin debe indicarla explícitamente (locationId
-// en el body/query), ya que admin ve y gestiona todas.
-export async function resolveOwnLocation(db: DB, auth: AuthContext) {
-  if (auth.role === "almacenista") return getAlmacenLocation(db, auth.companyId);
-  if (auth.role === "cajero") return getCajaLocationForUser(db, auth.companyId, auth.userId);
-  return null;
-}
+// GET /locations/:id/stock — catálogo + cantidad disponible en ESA ubicación.
+// Esto es lo que usan Inventario (almacén/caja) y el POS para saber qué hay
+// realmente disponible para vender/gestionar ahí — nunca el total de la
+// empresa.
+locations.get("/:id/stock", async (c) => {
+  const db = drizzle(c.env.DB, { schema });
+  const auth = c.get("auth");
+  const id = c.req.param("id");
 
-// Crea la caja de un cajero si todavía no la tiene (usuario nuevo, o un
-// usuario existente al que le acaban de cambiar el rol a "cajero").
-export async function ensureCajaLocation(db: DB, companyId: string, userId: string, userName: string) {
-  const existing = await getCajaLocationForUser(db, companyId, userId);
-  if (existing) {
-    if (!existing.active) {
-      await db.update(schema.inventoryLocations).set({ active: true }).where(eq(schema.inventoryLocations.id, existing.id));
-    }
-    return existing;
+  const location = await db.select().from(schema.inventoryLocations)
+    .where(and(eq(schema.inventoryLocations.id, id), eq(schema.inventoryLocations.companyId, auth.companyId))).get();
+  if (!location) return c.json({ ok: false, error: "Ubicación no encontrada" }, 404);
+  if (!(await canAccessLocation(db, auth, location))) {
+    return c.json({ ok: false, error: "No tiene permisos para ver esta ubicación" }, 403);
   }
-  return db.insert(schema.inventoryLocations).values({
-    id: generateUUID(),
-    companyId,
-    name: `Caja - ${userName}`,
-    type: "caja",
-    ownerUserId: userId,
-  }).returning().get();
-}
 
-// Suma de location_stock de un producto en TODAS las ubicaciones de la
-// empresa — se recalcula tras cualquier movimiento y queda en products.stock
-// para dashboards/alertas a nivel de empresa (nunca se usa para vender).
-export async function recomputeProductTotalStock(db: DB, productId: string) {
-  const rows = await db.select().from(schema.locationStock).where(eq(schema.locationStock.productId, productId)).all();
-  const total = rows.reduce((sum, r) => sum + Number(r.qty), 0);
-  await db.update(schema.products).set({ stock: total, updatedAt: new Date() }).where(eq(schema.products.id, productId));
-  return total;
-}
-
-export async function getOrCreateLocationStock(db: DB, locationId: string, productId: string) {
-  const existing = await db.select().from(schema.locationStock)
-    .where(and(eq(schema.locationStock.locationId, locationId), eq(schema.locationStock.productId, productId)))
-    .get();
-  if (existing) return existing;
-  return db.insert(schema.locationStock).values({
-    id: generateUUID(), locationId, productId, qty: 0,
-  }).returning().get();
-}
-
-export async function getLocationStockQty(db: DB, locationId: string, productId: string): Promise<number> {
-  const row = await db.select().from(schema.locationStock)
-    .where(and(eq(schema.locationStock.locationId, locationId), eq(schema.locationStock.productId, productId)))
-    .get();
-  return row ? Number(row.qty) : 0;
-}// Cambia (delta puede ser negativo) el stock de un producto en una
-// ubicación puntual, y recalcula el total de la empresa. Lanza error si el
-// resultado sería negativo, salvo que se indique allowNegative.
-export async function adjustLocationStock(
-  db: DB,
-  locationId: string,
-  productId: string,
-  delta: number,
-  opts: { allowNegative?: boolean } = {}
-): Promise<number> {
-  const row = await getOrCreateLocationStock(db, locationId, productId);
-  const newQty = parseFloat((Number(row.qty) + delta).toFixed(3));
-  if (newQty < 0 && !opts.allowNegative) {
-    throw new Error("Stock insuficiente en la ubicación de origen");
-  }
-  await db.update(schema.locationStock).set({ qty: newQty, updatedAt: new Date() }).where(eq(schema.locationStock.id, row.id));
-  await recomputeProductTotalStock(db, productId);
-  return newQty;
-}
-
-// Devuelve TODO el stock restante de una caja al almacén de la empresa —
-// usado al desactivar un cajero o cambiarle el rol. Queda registrado como
-// una transferencia normal (aprobada automáticamente) para que se vea igual
-// que cualquier otro envío en el historial/auditoría, con trazabilidad
-// completa de qué se devolvió y por qué.
-export async function returnAllStockToAlmacen(
-  db: DB,
-  companyId: string,
-  cajaLocationId: string,
-  byUserId: string,
-  reason: string
-): Promise<{ transferId: string | null; itemsReturned: number }> {
-  const almacen = await getAlmacenLocation(db, companyId);
-  if (!almacen) return { transferId: null, itemsReturned: 0 };
-
+  const products = await db.select().from(schema.products)
+    .where(and(eq(schema.products.companyId, auth.companyId), eq(schema.products.active, true))).all();
   const stockRows = await db.select().from(schema.locationStock)
-    .where(eq(schema.locationStock.locationId, cajaLocationId)).all();
-  const withStock = stockRows.filter(r => Number(r.qty) > 0);
-  if (withStock.length === 0) return { transferId: null, itemsReturned: 0 };
+    .where(eq(schema.locationStock.locationId, id)).all();
+  const stockMap: Record<string, number> = {};
+  for (const r of stockRows) stockMap[r.productId] = Number(r.qty);
 
-  const transfer = await db.insert(schema.stockTransfers).values({
-    id: generateUUID(),
-    companyId,
-    fromLocationId: cajaLocationId,
-    toLocationId: almacen.id,
-    requestedById: byUserId,
-    resolvedById: byUserId,
-    status: "aprobado",
-    notes: reason,
-    resolvedAt: new Date(),
-  }).returning().get();
+  const items = products.map(p => ({
+    id: p.id,
+    code: p.code,
+    name: p.name,
+    category: p.category,
+    unit: p.unit,
+    price: p.price,
+    cost: p.cost,
+    minStock: p.minStock,
+    active: p.active,
+    stock: stockMap[p.id] ?? 0, // stock EN ESTA ubicación, no el total de empresa
+  }));
 
-  for (const row of withStock) {
-    const product = await db.select().from(schema.products).where(eq(schema.products.id, row.productId)).get();
-    if (!product) continue;
-    await db.insert(schema.stockTransferItems).values({
-      id: generateUUID(),
-      transferId: transfer.id,
-      productId: product.id,
-      productCode: product.code,
-      productName: product.name,
-      unit: product.unit,
-      qty: Number(row.qty),
-    });
-    await adjustLocationStock(db, cajaLocationId, product.id, -Number(row.qty));
-    await adjustLocationStock(db, almacen.id, product.id, Number(row.qty), { allowNegative: true });
+  return c.json({ ok: true, data: { location, items } });
+});
+
+// POST /locations/:id/adjust — ajuste manual de stock (entrada/salida) en
+// una ubicación puntual. Reemplaza al viejo /products/:id/adjust-stock, que
+// operaba sobre un único stock global sin sentido ahora que hay varias
+// ubicaciones.
+locations.post("/:id/adjust", async (c) => {
+  const db = drizzle(c.env.DB, { schema });
+  const auth = c.get("auth");
+  const id = c.req.param("id");
+
+  const location = await db.select().from(schema.inventoryLocations)
+    .where(and(eq(schema.inventoryLocations.id, id), eq(schema.inventoryLocations.companyId, auth.companyId))).get();
+  if (!location) return c.json({ ok: false, error: "Ubicación no encontrada" }, 404);
+  if (!(await canAccessLocation(db, auth, location))) {
+    return c.json({ ok: false, error: "No tiene permisos para ajustar esta ubicación" }, 403);
   }
 
-  return { transferId: transfer.id, itemsReturned: withStock.length };
-}
+  const body = await c.req.json<{ productId: string; type: "entrada" | "salida"; qty: number; reason?: string }>();
+  const { productId, type, qty, reason } = body;
+  if (!productId || !["entrada", "salida"].includes(type) || !qty || qty <= 0) {
+    return c.json({ ok: false, error: "productId, type (entrada|salida) y qty > 0 son requeridos" }, 400);
+  }
+
+  const product = await db.select().from(schema.products)
+    .where(and(eq(schema.products.id, productId), eq(schema.products.companyId, auth.companyId))).get();
+  if (!product) return c.json({ ok: false, error: "Producto no encontrado" }, 404);
+
+  const delta = type === "entrada" ? qty : -qty;
+  let newQty: number;
+  try {
+    newQty = await adjustLocationStock(db, id, productId, delta);
+  } catch (err: any) {
+    return c.json({ ok: false, error: err.message }, 409);
+  }
+
+  await db.insert(schema.stockMovements).values({
+    id: generateUUID(),
+    companyId: auth.companyId,
+    productId,
+    userId: auth.userId,
+    type,
+    qty,
+    reason: reason ? `[${location.name}] ${reason}` : `Ajuste manual en ${location.name}`,
+  });
+
+  await logAudit(c.env, {
+    companyId: auth.companyId,
+    userId: auth.userId,
+    action: "location.adjust_stock",
+    entity: "location_stock",
+    entityId: id,
+    detail: { locationName: location.name, productId, productName: product.name, type, qty, reason: reason || null, newQty },
+    ip: getClientIp(c),
+  });
+
+  return c.json({ ok: true, data: { locationId: id, productId, qty: newQty } });
+});
+
+export default locations;
