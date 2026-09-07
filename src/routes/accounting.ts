@@ -5,6 +5,7 @@ import * as schema from "../db/schema";
 import { authMiddleware } from "../middleware/auth";
 import { requireModule } from "../middleware/roles";
 import { generateUUID } from "../lib/jwt";
+import { logAudit, getClientIp } from "../lib/audit";
 
 const accounting = new Hono<{ Bindings: Env }>();
 
@@ -93,6 +94,13 @@ accounting.post("/expenses", requireModule("contabilidad"), async (c) => {
     method: method as any,
   }).returning().get();
 
+  await logAudit(c.env, {
+    companyId: auth.companyId, userId: auth.userId,
+    action: "expense.create", entity: "expense", entityId: expense.id,
+    detail: { concept, amount, category: category || "Otros" },
+    ip: getClientIp(c),
+  });
+
   return c.json({ ok: true, data: expense }, 201);
 });
 
@@ -113,6 +121,14 @@ accounting.put("/expenses/:id", requireModule("contabilidad"), async (c) => {
 
   await db.update(schema.expenses).set(updates).where(eq(schema.expenses.id, id));
   const updated = await db.select().from(schema.expenses).where(eq(schema.expenses.id, id)).get();
+
+  await logAudit(c.env, {
+    companyId: auth.companyId, userId: auth.userId,
+    action: "expense.update", entity: "expense", entityId: id,
+    detail: { before: { concept: existing.concept, amount: existing.amount }, changes: updates },
+    ip: getClientIp(c),
+  });
+
   return c.json({ ok: true, data: updated });
 });
 
@@ -126,6 +142,14 @@ accounting.delete("/expenses/:id", requireModule("contabilidad"), async (c) => {
   if (!existing) return c.json({ ok: false, error: "Gasto no encontrado" }, 404);
 
   await db.delete(schema.expenses).where(eq(schema.expenses.id, id));
+
+  await logAudit(c.env, {
+    companyId: auth.companyId, userId: auth.userId,
+    action: "expense.delete", entity: "expense", entityId: id,
+    detail: { concept: existing.concept, amount: existing.amount },
+    ip: getClientIp(c),
+  });
+
   return c.json({ ok: true });
 });
 

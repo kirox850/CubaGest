@@ -7,6 +7,7 @@ import { requireModule } from "../middleware/roles";
 import { checkLimit } from "../middleware/plans";
 import { generateUUID } from "../lib/jwt";
 import { nextInvoiceNumber } from "../lib/invoiceNumber";
+import { resolveOwnLocation, getLocationStockQty, adjustLocationStock } from "../lib/locations";
 
 const sync = new Hono<{ Bindings: Env }>();
 
@@ -23,6 +24,13 @@ sync.post("/", requireModule("pos"), checkLimit("sales"), async (c) => {
 
   if (!Array.isArray(offlineSales) || offlineSales.length === 0) {
     return c.json({ ok: false, error: "No hay ventas para sincronizar" }, 400);
+  }
+
+  // Misma ubicación para todas las ventas de este lote: son todas del mismo
+  // dispositivo/cajero que estuvo offline.
+  const location = await resolveOwnLocation(db, auth);
+  if (!location) {
+    return c.json({ ok: false, error: "No tiene una ubicación de venta asignada" }, 400);
   }
 
   // Cargar taxRate de la empresa una sola vez
@@ -58,7 +66,7 @@ sync.post("/", requireModule("pos"), checkLimit("sales"), async (c) => {
         itemName: string;
       }[] = [];
 
-      // Validar stock de cada producto antes de procesar
+      // Validar stock de cada producto (en la ubicación del cajero) antes de procesar
       for (const item of items) {
         const product = await db
           .select()
@@ -76,9 +84,10 @@ sync.post("/", requireModule("pos"), checkLimit("sales"), async (c) => {
         }
 
         const qty = Number(item.qty);
-        if (Number(product.stock) < qty) {
+        const available = await getLocationStockQty(db, location.id, product.id);
+        if (available < qty) {
           throw new Error(
-            `Stock insuficiente para '${product.name}' — disponible: ${product.stock}, solicitado: ${qty}`
+            `Stock insuficiente para '${product.name}' en ${location.name} — disponible: ${available}, solicitado: ${qty}`
           );
         }
 
@@ -110,6 +119,7 @@ sync.post("/", requireModule("pos"), checkLimit("sales"), async (c) => {
         id: saleId,
         companyId: auth.companyId,
         userId: auth.userId,
+        locationId: location.id,
         invoiceNumber,
         date: saleDate,
         clientName: clientName || "Consumidor Final",
@@ -135,10 +145,7 @@ sync.post("/", requireModule("pos"), checkLimit("sales"), async (c) => {
           total: lineTotal,
         });
 
-        await db
-          .update(schema.products)
-          .set({ stock: Number(product.stock) - qty, updatedAt: new Date() })
-          .where(eq(schema.products.id, product.id));
+        await adjustLocationStock(db, location.id, product.id, -qty);
 
         await db.insert(schema.stockMovements).values({
           id: generateUUID(),
@@ -147,7 +154,7 @@ sync.post("/", requireModule("pos"), checkLimit("sales"), async (c) => {
           userId: auth.userId,
           type: "venta",
           qty,
-          reason: `Venta ${invoiceNumber} (sincronización offline)`,
+          reason: `Venta ${invoiceNumber} (sincronización offline, ${location.name})`,
         });
       }
 

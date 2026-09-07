@@ -6,6 +6,8 @@ import { authMiddleware } from "../middleware/auth";
 import { requireModule, requireAnyModule } from "../middleware/roles";
 import { checkLimit } from "../middleware/plans";
 import { generateUUID } from "../lib/jwt";
+import { logAudit, getClientIp } from "../lib/audit";
+import { getAlmacenLocation, adjustLocationStock } from "../lib/locations";
 
 const products = new Hono<{ Bindings: Env }>();
 
@@ -50,10 +52,26 @@ products.post("/", requireModule("inventario"), checkLimit("products"), async (c
     code, name,
     category: category || "Otros",
     unit: unit || "ud",
-    price, cost: cost || 0, stock: stock || 0, minStock: minStock || 0,
+    price, cost: cost || 0, stock: 0, minStock: minStock || 0,
   }).returning().get();
 
-  return c.json({ ok: true, data: product }, 201);
+  // Todo producto nuevo nace en el Almacén Central — de ahí se reparte a
+  // las cajas mediante envíos. El stock inicial que se indique en el
+  // formulario se siembra directamente ahí.
+  const almacen = await getAlmacenLocation(db, auth.companyId);
+  if (almacen && Number(stock) > 0) {
+    await adjustLocationStock(db, almacen.id, product.id, Number(stock), { allowNegative: true });
+  }
+  const finalProduct = await db.select().from(schema.products).where(eq(schema.products.id, product.id)).get();
+
+  await logAudit(c.env, {
+    companyId: auth.companyId, userId: auth.userId,
+    action: "product.create", entity: "product", entityId: product.id,
+    detail: { code, name, price, initialStock: stock || 0 },
+    ip: getClientIp(c),
+  });
+
+  return c.json({ ok: true, data: finalProduct }, 201);
 });
 
 products.put("/:id", requireModule("inventario"), async (c) => {
@@ -75,6 +93,14 @@ products.put("/:id", requireModule("inventario"), async (c) => {
 
   await db.update(schema.products).set(updates).where(eq(schema.products.id, id));
   const updated = await db.select().from(schema.products).where(eq(schema.products.id, id)).get();
+
+  await logAudit(c.env, {
+    companyId: auth.companyId, userId: auth.userId,
+    action: "product.update", entity: "product", entityId: id,
+    detail: { before: { name: existing.name, price: existing.price, cost: existing.cost, active: existing.active }, changes: updates },
+    ip: getClientIp(c),
+  });
+
   return c.json({ ok: true, data: updated });
 });
 
@@ -88,6 +114,14 @@ products.delete("/:id", requireModule("inventario"), async (c) => {
   if (!existing) return c.json({ ok: false, error: "Producto no encontrado" }, 404);
 
   await db.update(schema.products).set({ active: false, updatedAt: new Date() }).where(eq(schema.products.id, id));
+
+  await logAudit(c.env, {
+    companyId: auth.companyId, userId: auth.userId,
+    action: "product.deactivate", entity: "product", entityId: id,
+    detail: { name: existing.name, code: existing.code },
+    ip: getClientIp(c),
+  });
+
   return c.json({ ok: true });
 });
 
@@ -102,39 +136,14 @@ products.post("/:id/reactivate", requireModule("inventario"), async (c) => {
 
   await db.update(schema.products).set({ active: true, updatedAt: new Date() }).where(eq(schema.products.id, id));
   const updated = await db.select().from(schema.products).where(eq(schema.products.id, id)).get();
-  return c.json({ ok: true, data: updated });
-});
 
-products.post("/:id/adjust-stock", requireModule("inventario"), async (c) => {
-  const db = drizzle(c.env.DB, { schema });
-  const auth = c.get("auth");
-  const id = c.req.param("id");
-  const body = await c.req.json<{ type: "entrada" | "salida"; qty: number; reason?: string }>();
-  const { type, qty, reason } = body;
-
-  if (!["entrada", "salida"].includes(type) || !qty || qty <= 0) {
-    return c.json({ ok: false, error: "type debe ser entrada|salida y qty > 0" }, 400);
-  }
-
-  const product = await db.select().from(schema.products)
-    .where(and(eq(schema.products.id, id), eq(schema.products.companyId, auth.companyId))).get();
-  if (!product) return c.json({ ok: false, error: "Producto no encontrado" }, 404);
-
-  const newStock = type === "entrada"
-    ? Number(product.stock) + qty
-    : Math.max(0, Number(product.stock) - qty);
-
-  await db.update(schema.products).set({ stock: newStock, updatedAt: new Date() }).where(eq(schema.products.id, id));
-
-  await db.insert(schema.stockMovements).values({
-    id: generateUUID(),
-    companyId: auth.companyId,
-    productId: product.id,
-    userId: auth.userId,
-    type, qty, reason: reason || null,
+  await logAudit(c.env, {
+    companyId: auth.companyId, userId: auth.userId,
+    action: "product.reactivate", entity: "product", entityId: id,
+    detail: { name: existing.name, code: existing.code },
+    ip: getClientIp(c),
   });
 
-  const updated = await db.select().from(schema.products).where(eq(schema.products.id, id)).get();
   return c.json({ ok: true, data: updated });
 });
 

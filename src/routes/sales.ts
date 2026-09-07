@@ -7,6 +7,8 @@ import { requireModule } from "../middleware/roles";
 import { checkLimit } from "../middleware/plans";
 import { generateUUID } from "../lib/jwt";
 import { nextInvoiceNumber } from "../lib/invoiceNumber";
+import { logAudit, getClientIp } from "../lib/audit";
+import { resolveOwnLocation, getLocationStockQty, adjustLocationStock } from "../lib/locations";
 
 const sales = new Hono<{ Bindings: Env }>();
 
@@ -73,6 +75,7 @@ sales.post("/", requireModule("pos"), checkLimit("sales"), async (c) => {
     clientPhone?: string;
     currency?: string;
     payMethod: string;
+    locationId?: string; // solo relevante si vende un admin (no tiene ubicación propia fija)
     items: { productId: string; qty: number }[];
   }>();
 
@@ -82,6 +85,16 @@ sales.post("/", requireModule("pos"), checkLimit("sales"), async (c) => {
     return c.json({ ok: false, error: "La venta debe tener al menos un producto" }, 400);
   }
   if (!payMethod) return c.json({ ok: false, error: "payMethod es requerido" }, 400);
+
+  // Cada venta descuenta de la caja propia del cajero (o del almacén, si
+  // vende un almacenista) — nunca de un pool global compartido. Un admin
+  // sin ubicación propia debe indicar locationId explícitamente.
+  let location = await resolveOwnLocation(db, auth);
+  if (!location && auth.role === "admin" && body.locationId) {
+    location = await db.select().from(schema.inventoryLocations)
+      .where(and(eq(schema.inventoryLocations.id, body.locationId), eq(schema.inventoryLocations.companyId, auth.companyId))).get() ?? null;
+  }
+  if (!location) return c.json({ ok: false, error: "No tiene una ubicación de venta asignada" }, 400);
 
   const company = await db
     .select()
@@ -108,9 +121,10 @@ sales.post("/", requireModule("pos"), checkLimit("sales"), async (c) => {
 
     const qty = Number(it.qty);
     if (!qty || qty <= 0) return c.json({ ok: false, error: `Cantidad inválida para ${product.name}` }, 400);
-    if (Number(product.stock) < qty) {
+    const available = await getLocationStockQty(db, location.id, product.id);
+    if (available < qty) {
       return c.json(
-        { ok: false, error: `Stock insuficiente para ${product.name} (disponible: ${product.stock})` },
+        { ok: false, error: `Stock insuficiente para ${product.name} en ${location.name} (disponible: ${available})` },
         409
       );
     }
@@ -133,6 +147,7 @@ sales.post("/", requireModule("pos"), checkLimit("sales"), async (c) => {
     companyId: auth.companyId,
     invoiceNumber,
     userId: auth.userId,
+    locationId: location.id,
     date: new Date().toISOString().split("T")[0],
     clientName: clientName || "Consumidor Final",
     clientNit: clientNit || "00000000000",
@@ -140,7 +155,7 @@ sales.post("/", requireModule("pos"), checkLimit("sales"), async (c) => {
     subtotal,
     tax,
     total,
-    currency: currency || company?.defaultCurrency || "CUP",
+    currency: (currency || company?.defaultCurrency || "CUP") as any,
     payMethod: payMethod as any,
     status: "emitida",
   });
@@ -156,10 +171,7 @@ sales.post("/", requireModule("pos"), checkLimit("sales"), async (c) => {
       total: lineTotal,
     });
 
-    await db
-      .update(schema.products)
-      .set({ stock: Number(product.stock) - qty, updatedAt: new Date() })
-      .where(eq(schema.products.id, product.id));
+    await adjustLocationStock(db, location.id, product.id, -qty);
 
     await db.insert(schema.stockMovements).values({
       id: generateUUID(),
@@ -168,7 +180,7 @@ sales.post("/", requireModule("pos"), checkLimit("sales"), async (c) => {
       userId: auth.userId,
       type: "venta",
       qty,
-      reason: `Venta ${invoiceNumber}`,
+      reason: `Venta ${invoiceNumber} (${location.name})`,
     });
   }
 
@@ -240,11 +252,8 @@ sales.post("/:id/void", requireModule("pos"), async (c) => {
       .from(schema.products)
       .where(and(eq(schema.products.id, item.productId), eq(schema.products.companyId, auth.companyId)))
       .get();
-    if (product) {
-      await db
-        .update(schema.products)
-        .set({ stock: Number(product.stock) + Number(item.qty), updatedAt: new Date() })
-        .where(eq(schema.products.id, product.id));
+    if (product && sale.locationId) {
+      await adjustLocationStock(db, sale.locationId, product.id, Number(item.qty), { allowNegative: true });
 
       await db.insert(schema.stockMovements).values({
         id: generateUUID(),
@@ -259,6 +268,13 @@ sales.post("/:id/void", requireModule("pos"), async (c) => {
   }
 
   await db.update(schema.sales).set({ status: "anulada" }).where(eq(schema.sales.id, id));
+
+  await logAudit(c.env, {
+    companyId: auth.companyId, userId: auth.userId,
+    action: "sale.void", entity: "sale", entityId: id,
+    detail: { invoiceNumber: sale.invoiceNumber, total: sale.total },
+    ip: getClientIp(c),
+  });
 
   const updated = await db.select().from(schema.sales).where(eq(schema.sales.id, id)).get();
   return c.json({ ok: true, data: updated });
