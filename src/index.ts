@@ -11,6 +11,9 @@ import accounting from "./routes/accounting";
 import subscriptions, { renewQvapaySubscriptions } from "./routes/subscriptions";
 import dashboard from "./routes/dashboard";
 import closing from "./routes/closing";
+import locations from "./routes/locations";
+import transfers from "./routes/transfers";
+import audit from "./routes/audit";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -36,6 +39,9 @@ app.route("/accounting", accounting);
 app.route("/subscription", subscriptions);
 app.route("/dashboard", dashboard);
 app.route("/closing", closing);
+app.route("/locations", locations);
+app.route("/transfers", transfers);
+app.route("/audit", audit);
 
 app.onError((err, c) => {
   console.error(err);
