@@ -3,15 +3,15 @@ import { eq, and, desc, like } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import * as schema from "../db/schema";
 import { authMiddleware } from "../middleware/auth";
-import { requireRole } from "../middleware/roles";
 
 const audit = new Hono<{ Bindings: Env }>();
 
 audit.use("*", authMiddleware);
 
-// GET /audit — solo admin. Filtros opcionales: entity, action (coincidencia
+// GET /audit — visible para cualquier usuario autenticado de la empresa
+// (antes solo admin). Filtros opcionales: entity, action (coincidencia
 // parcial), userId. Paginado simple con limit/offset.
-audit.get("/", requireRole("admin"), async (c) => {
+audit.get("/", async (c) => {
   const db = drizzle(c.env.DB, { schema });
   const auth = c.get("auth");
   const { entity, action, userId, limit, offset } = c.req.query();

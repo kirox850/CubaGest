@@ -142,7 +142,6 @@ transfers.get("/", async (c) => {
 });
 
 async function canResolveTransfer(db: ReturnType<typeof drizzle>, auth: any, transfer: typeof schema.stockTransfers.$inferSelect) {
-  if (auth.role === "admin") return true;
   const toLocation = await db.select().from(schema.inventoryLocations).where(eq(schema.inventoryLocations.id, transfer.toLocationId)).get();
   if (!toLocation) return false;
   if (auth.role === "almacenista") return toLocation.type === "almacen";
