@@ -249,6 +249,25 @@ export const refreshTokens = sqliteTable("refresh_tokens", {
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
 });
 
+// Tokens de un solo uso para "establecer contraseña" (cuenta nueva) y
+// "olvidé mi contraseña" (cuenta existente) — ambos usan el mismo mecanismo:
+// se genera un token aleatorio, se manda por correo, y el usuario elige su
+// propia contraseña sin que admin (ni nadie más) la vea ni la escriba nunca.
+// Guardamos el HASH del token, nunca el token en sí — igual que una
+// contraseña, para que una fuga de la base de datos no sirva para nada.
+export const passwordTokens = sqliteTable("password_tokens", {
+  id: text("id").primaryKey(),
+  userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  tokenHash: text("token_hash").notNull(),
+  purpose: text("purpose", { enum: ["set_password", "forgot_password"] }).notNull(),
+  expiresAt: integer("expires_at", { mode: "timestamp" }).notNull(),
+  usedAt: integer("used_at", { mode: "timestamp" }),
+  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+}, (table) => ({
+  userIdx: index("password_tokens_user_idx").on(table.userId),
+  tokenHashIdx: uniqueIndex("password_tokens_hash_idx").on(table.tokenHash),
+}));
+
 // Tabla de contadores atómicos:
 // - Números de factura correlativos por empresa/año: "invoice:{companyId}:{year}"
 // - Rate limiting de login por IP: "ratelimit:{ip}:{ventana}"
