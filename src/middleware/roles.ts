@@ -4,7 +4,7 @@ const ROLES: Record<string, { label: string; perms: string[] }> = {
   admin:       { label: "Administrador", perms: ["dashboard","inventario","facturacion","contabilidad","cierre","usuarios","config","auditoria"] },
   cajero:      { label: "Cajero",        perms: ["dashboard","pos","facturacion","cierre","auditoria"] },
   contador:    { label: "Contador",      perms: ["dashboard","contabilidad","cierre","auditoria"] },
-  almacenista: { label: "Almacenista",   perms: ["dashboard","inventario","cierre","auditoria"] },
+  almacenista: { label: "Almacenista",   perms: ["dashboard","inventario","pos","cierre","auditoria"] },
 };
 
 export const ROLE_NAMES = Object.keys(ROLES);
