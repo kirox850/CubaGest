@@ -5,6 +5,8 @@ import * as schema from "../db/schema";
 import { signToken, verifyToken, generateUUID } from "../lib/jwt";
 import { hashPassword, comparePassword } from "../lib/hash";
 import { authMiddleware } from "../middleware/auth";
+import { issuePasswordToken, PENDING_ACTIVATION } from "../lib/passwordTokens";
+import { hashToken } from "../lib/tokens";
 
 const auth = new Hono<{ Bindings: Env }>();
 
@@ -140,6 +142,10 @@ auth.post("/login", async (c) => {
     .get();
   if (!user) return c.json({ ok: false, error: "Credenciales incorrectas" }, 401);
 
+  if (user.passwordHash === PENDING_ACTIVATION) {
+    return c.json({ ok: false, error: "Esta cuenta todavía no tiene contraseña. Revisa el correo con el link para activarla, o pide que te lo reenvíen." }, 401);
+  }
+
   const valid = await comparePassword(password, user.passwordHash);
   if (!valid) return c.json({ ok: false, error: "Credenciales incorrectas" }, 401);
 
@@ -228,6 +234,62 @@ auth.get("/me", authMiddleware, async (c) => {
     .where(eq(schema.companies.id, user.companyId))
     .get();
   return c.json({ ok: true, user: publicUser(user, company) });
+});
+
+// POST /auth/forgot-password
+// Siempre responde igual exista o no la cuenta — evita que alguien use esto
+// para averiguar qué correos están registrados.
+auth.post("/forgot-password", async (c) => {
+  const ip = c.req.header("CF-Connecting-IP") || "unknown";
+  if (!(await checkRateLimit(ip, c.env))) {
+    return c.json({ ok: false, error: "Demasiados intentos. Intente de nuevo en 15 minutos." }, 429);
+  }
+
+  const db = drizzle(c.env.DB, { schema });
+  const body = await c.req.json<{ email: string }>().catch(() => ({} as { email: string }));
+  const genericResponse = { ok: true, message: "Si el correo existe en nuestro sistema, te llegará un link para restablecer tu contraseña." };
+
+  if (!body.email) return c.json(genericResponse);
+
+  const user = await db.select().from(schema.users)
+    .where(and(eq(schema.users.email, body.email), eq(schema.users.active, true))).get();
+  if (!user) return c.json(genericResponse);
+
+  await issuePasswordToken(c.env, db, user, "forgot_password");
+  return c.json(genericResponse);
+});
+
+// POST /auth/set-password
+// Usa el token de "establecer contraseña" (cuenta nueva) o "olvidé mi
+// contraseña" (cuenta existente) — funcionan igual en este endpoint.
+auth.post("/set-password", async (c) => {
+  const db = drizzle(c.env.DB, { schema });
+  const body = await c.req.json<{ token: string; password: string }>();
+  const { token, password } = body;
+
+  if (!token || !password) return c.json({ ok: false, error: "Token y contraseña son requeridos" }, 400);
+  if (password.length < 8) return c.json({ ok: false, error: "La contraseña debe tener al menos 8 caracteres" }, 400);
+
+  const tokenHash = await hashToken(token);
+  const tokenRow = await db.select().from(schema.passwordTokens)
+    .where(eq(schema.passwordTokens.tokenHash, tokenHash)).get();
+
+  if (!tokenRow) return c.json({ ok: false, error: "Este link no es válido. Pide que te lo reenvíen." }, 400);
+  if (tokenRow.usedAt) return c.json({ ok: false, error: "Este link ya se usó. Pide uno nuevo si necesitas cambiar tu contraseña otra vez." }, 400);
+  if (new Date(tokenRow.expiresAt) < new Date()) return c.json({ ok: false, error: "Este link venció. Pide que te lo reenvíen." }, 400);
+
+  const user = await db.select().from(schema.users).where(eq(schema.users.id, tokenRow.userId)).get();
+  if (!user) return c.json({ ok: false, error: "Usuario no encontrado" }, 404);
+
+  const passwordHash = await hashPassword(password);
+  await db.update(schema.users).set({ passwordHash }).where(eq(schema.users.id, user.id));
+  await db.update(schema.passwordTokens).set({ usedAt: new Date() }).where(eq(schema.passwordTokens.id, tokenRow.id));
+
+  // Cambiar la contraseña cierra cualquier otra sesión activa — por
+  // seguridad, sobre todo si el motivo fue "me hackearon"/"perdí el celular".
+  await db.delete(schema.refreshTokens).where(eq(schema.refreshTokens.userId, user.id));
+
+  return c.json({ ok: true, message: "Contraseña establecida correctamente. Ya puedes iniciar sesión." });
 });
 
 export default auth;

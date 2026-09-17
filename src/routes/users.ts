@@ -5,10 +5,10 @@ import * as schema from "../db/schema";
 import { authMiddleware } from "../middleware/auth";
 import { requireModule, requireRole } from "../middleware/roles";
 import { checkLimit } from "../middleware/plans";
-import { hashPassword } from "../lib/hash";
 import { generateUUID } from "../lib/jwt";
 import { logAudit, getClientIp } from "../lib/audit";
 import { ensureCajaLocation, getCajaLocationForUser, returnAllStockToAlmacen } from "../lib/locations";
+import { issuePasswordToken, PENDING_ACTIVATION } from "../lib/passwordTokens";
 
 const users = new Hono<{ Bindings: Env }>();
 
@@ -29,17 +29,21 @@ users.get("/", requireModule("usuarios"), async (c) => {
     active: schema.users.active,
     lastLoginAt: schema.users.lastLoginAt,
     createdAt: schema.users.createdAt,
+    passwordHash: schema.users.passwordHash,
   }).from(schema.users).where(eq(schema.users.companyId, auth.companyId)).orderBy(schema.users.createdAt);
-  return c.json({ ok: true, data: rows });
+  // pending = true significa que todavía no activó su cuenta (nunca eligió
+  // contraseña). No exponemos passwordHash real, solo si es el marcador.
+  const result = rows.map(({ passwordHash, ...u }) => ({ ...u, pending: passwordHash === PENDING_ACTIVATION }));
+  return c.json({ ok: true, data: result });
 });
 
 users.post("/", requireModule("usuarios"), checkLimit("users"), async (c) => {
   const db = drizzle(c.env.DB, { schema });
   const auth = c.get("auth");
-  const body = await c.req.json<{ name: string; email: string; password: string; role: string; nit?: string }>();
-  const { name, email, password, role, nit } = body;
+  const body = await c.req.json<{ name: string; email: string; role: string; nit?: string }>();
+  const { name, email, role, nit } = body;
 
-  if (!name || !email || !password || !role) {
+  if (!name || !email || !role) {
     return c.json({ ok: false, error: "Faltan campos requeridos" }, 400);
   }
   if (!VALID_ROLES.includes(role)) {
@@ -49,11 +53,13 @@ users.post("/", requireModule("usuarios"), checkLimit("users"), async (c) => {
   const existing = await db.select().from(schema.users).where(eq(schema.users.email, email)).get();
   if (existing) return c.json({ ok: false, error: "Ya existe un usuario con ese correo" }, 409);
 
-  const passwordHash = await hashPassword(password);
+  // No se pide ni se guarda ninguna contraseña acá — el propio usuario la
+  // elige a través del link que le llega por correo. Mientras tanto queda
+  // con un marcador que nunca puede usarse para iniciar sesión.
   const user = await db.insert(schema.users).values({
     id: generateUUID(),
     companyId: auth.companyId,
-    name, email, passwordHash, role: role as any, nit: nit || null,
+    name, email, passwordHash: PENDING_ACTIVATION, role: role as any, nit: nit || null,
   }).returning().get();
 
   // Un cajero nuevo tiene su propia caja/inventario desde el día uno, con
@@ -72,15 +78,21 @@ users.post("/", requireModule("usuarios"), checkLimit("users"), async (c) => {
     });
   }
 
+  const { url, emailSent } = await issuePasswordToken(c.env, db, user, "set_password");
+
   await logAudit(c.env, {
     companyId: auth.companyId, userId: auth.userId,
     action: "user.create", entity: "user", entityId: user.id,
-    detail: { name, email, role },
+    detail: { name, email, role, emailSent },
     ip: getClientIp(c),
   });
 
   const { passwordHash: _omit, ...safe } = user;
-  return c.json({ ok: true, data: safe }, 201);
+  // setPasswordUrl viaja en la respuesta como respaldo — por si el correo no
+  // llega (spam, correo mal escrito, etc.) admin puede compartir el link a
+  // mano. No es un problema de seguridad porque solo lo ve admin, que ya
+  // tiene acceso total a la empresa de todas formas.
+  return c.json({ ok: true, data: { ...safe, setPasswordUrl: url, emailSent } }, 201);
 });
 
 users.put("/:id", requireModule("usuarios"), async (c) => {
@@ -92,7 +104,7 @@ users.put("/:id", requireModule("usuarios"), async (c) => {
     .where(and(eq(schema.users.id, id), eq(schema.users.companyId, auth.companyId))).get();
   if (!user) return c.json({ ok: false, error: "Usuario no encontrado" }, 404);
 
-  const body = await c.req.json<{ name?: string; role?: string; nit?: string; active?: boolean; password?: string }>();
+  const body = await c.req.json<{ name?: string; role?: string; nit?: string; active?: boolean }>();
   const updates: Partial<typeof schema.users.$inferInsert> = {};
 
   if (body.name !== undefined) updates.name = body.name;
@@ -105,7 +117,9 @@ users.put("/:id", requireModule("usuarios"), async (c) => {
   }
   if (body.nit !== undefined) updates.nit = body.nit;
   if (body.active !== undefined) updates.active = body.active;
-  if (body.password) updates.passwordHash = await hashPassword(body.password);
+  // Ya no se acepta "password" acá — admin no puede escribir la contraseña
+  // de nadie. Para ayudar a alguien a cambiarla, usa
+  // POST /users/:id/resend-set-password, que manda un link nuevo.
 
   // Si deja de ser cajero, su inventario vuelve al almacén automáticamente
   // — no se queda "flotando" sin dueño operativo.
@@ -146,7 +160,7 @@ users.put("/:id", requireModule("usuarios"), async (c) => {
   await logAudit(c.env, {
     companyId: auth.companyId, userId: auth.userId,
     action: "user.update", entity: "user", entityId: id,
-    detail: { before: { name: user.name, role: user.role, active: user.active }, changes: { ...updates, passwordHash: updates.passwordHash ? "(cambiada)" : undefined } },
+    detail: { before: { name: user.name, role: user.role, active: user.active }, changes: updates },
     ip: getClientIp(c),
   });
 
@@ -196,6 +210,33 @@ users.delete("/:id", requireModule("usuarios"), requireRole("admin"), async (c) 
   });
 
   return c.json({ ok: true });
+});
+
+// POST /users/:id/resend-set-password
+// Regenera y reenvía el link de establecer contraseña — es lo que admin usa
+// ahora en vez de escribirle una contraseña a alguien. Sirve tanto para una
+// cuenta que nunca activó la suya, como para "ayudar" a alguien a resetear
+// la suya sin que admin llegue a verla en ningún momento.
+users.post("/:id/resend-set-password", requireModule("usuarios"), async (c) => {
+  const db = drizzle(c.env.DB, { schema });
+  const auth = c.get("auth");
+  const id = c.req.param("id");
+
+  const user = await db.select().from(schema.users)
+    .where(and(eq(schema.users.id, id), eq(schema.users.companyId, auth.companyId))).get();
+  if (!user) return c.json({ ok: false, error: "Usuario no encontrado" }, 404);
+
+  const purpose = user.passwordHash === PENDING_ACTIVATION ? "set_password" : "forgot_password";
+  const { url, emailSent } = await issuePasswordToken(c.env, db, user, purpose);
+
+  await logAudit(c.env, {
+    companyId: auth.companyId, userId: auth.userId,
+    action: "user.resend_password_link", entity: "user", entityId: id,
+    detail: { name: user.name, email: user.email, emailSent },
+    ip: getClientIp(c),
+  });
+
+  return c.json({ ok: true, data: { setPasswordUrl: url, emailSent } });
 });
 
 export default users;
