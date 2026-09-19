@@ -40,3 +40,6 @@ head_sampling_rate = 1
 # APP_URL
 # RESEND_API_KEY
 # RESEND_FROM_EMAIL
+# ELTOQUE_API_TOKEN  ← token de la API oficial de tasas de elToque.
+#   Solicitarlo en https://tasas.eltoque.com/docs/ (formulario por aplicación).
+#   Sin token la API responde 401/403 y el backend cae al raspado público.
