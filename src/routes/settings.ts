@@ -36,7 +36,7 @@ const ELTOQUE_TTL_MS = 5 * 60 * 1000;
 // corresponda). SIN token la API oficial responde 401/403 y el backend
 // cae al raspado de la página pública (ver scrapeElToquePage).
 function elToqueUrl(env: Env): string {
-  return (env as any).ELTOQUE_API_URL || "https://tasas.eltoque.com/v1/current";
+  return (env as any).ELTOQUE_API_URL || "https://tasas.eltoque.com/v1/trmi";
 }
 
 function elToqueHeaders(env: Env): Record<string, string> {
