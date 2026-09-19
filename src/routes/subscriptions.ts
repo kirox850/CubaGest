@@ -202,6 +202,14 @@ subscriptions.get("/qvapay-callback", async (c) => {
       nextPaymentDate,
       failedAttempts: 0,
     }).where(eq(schema.companies.id, companyId));
+    // Programa de referidos: si esta empresa fue referida, el referente
+    // recibe el MISMO plan de regalo 30 días (una vez por referido).
+    try {
+      const { applyReferralBonusOnPayment } = await import("./referrals");
+      await applyReferralBonusOnPayment(db, c.env, companyId, plan);
+    } catch (e) {
+      console.error("referral bonus fallo (no bloquea el pago):", e);
+    }
     return c.redirect(`${frontendUrl}/?qvapay=activated`, 302);
   } catch (err: any) {
     console.error("QvaPay: fallo el cobro inicial tras autorización:", err.message);
@@ -243,6 +251,11 @@ export async function renewQvapaySubscriptions(env: Env) {
         nextPaymentDate,
         failedAttempts: 0,
       }).where(eq(schema.companies.id, company.id));
+      // Referidos: por si el vínculo se creó después del primer pago
+      try {
+        const { applyReferralBonusOnPayment } = await import("./referrals");
+        await applyReferralBonusOnPayment(db, env, company.id, company.plan);
+      } catch { /* no bloquea la renovación */ }
     } catch (err: any) {
       const failedAttempts = (company.failedAttempts || 0) + 1;
       console.error(`QvaPay: fallo la renovación de ${company.id}:`, err.message);

@@ -14,6 +14,9 @@ import closing from "./routes/closing";
 import locations from "./routes/locations";
 import transfers from "./routes/transfers";
 import audit from "./routes/audit";
+import discounts from "./routes/discounts";
+import settings from "./routes/settings";
+import referrals from "./routes/referrals";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -42,6 +45,9 @@ app.route("/closing", closing);
 app.route("/locations", locations);
 app.route("/transfers", transfers);
 app.route("/audit", audit);
+app.route("/discounts", discounts);
+app.route("/settings", settings);
+app.route("/referrals", referrals);
 
 app.onError((err, c) => {
   console.error(err);

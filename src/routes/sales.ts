@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { eq, and, gte, lte } from "drizzle-orm";
+import { eq, and, gte, lte, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import * as schema from "../db/schema";
 import { authMiddleware } from "../middleware/auth";
@@ -75,8 +75,11 @@ sales.post("/", requireModule("pos"), checkLimit("sales"), async (c) => {
     clientPhone?: string;
     currency?: string;
     payMethod: string;
-    locationId?: string; // solo relevante si vende un admin (no tiene ubicación propia fija)
+    locationId?: string;
     items: { productId: string; qty: number }[];
+    // Descuento de tipo "venta" (aplicado al total). Los de tipo "producto"
+    // viajan dentro de cada item como discountId.
+    discountId?: string;
   }>();
 
   const { clientName, clientNit, clientPhone, currency, payMethod, items } = body;
@@ -102,8 +105,34 @@ sales.post("/", requireModule("pos"), checkLimit("sales"), async (c) => {
     .where(eq(schema.companies.id, auth.companyId))
     .get();
 
+  // ── Validación de moneda y método de pago contra la config de empresa ────
+  const ALLOWED_PAY_METHODS = ["efectivo", "transferencia", "usd", "clasica", "zelle", "mlc", "eur", "tarjeta"];
+  if (!ALLOWED_PAY_METHODS.includes(payMethod)) {
+    return c.json({ ok: false, error: "Método de pago inválido" }, 400);
+  }
+  const settingsRow = await db.select().from(schema.companySettings)
+    .where(eq(schema.companySettings.companyId, auth.companyId)).get();
+  const allowedCurrencies: string[] = (settingsRow?.currencies as string[]) || ["CUP"];
+  const saleCurrency = (currency || company?.defaultCurrency || "CUP");
+  if (!allowedCurrencies.includes(saleCurrency)) {
+    return c.json({ ok: false, error: `La moneda ${saleCurrency} no está habilitada para tu negocio` }, 400);
+  }
+
+  // ── Descuentos ──────────────────────────────────────────────────────────
+  const { computeDiscountAmount, isDiscountAvailable } = await import("./discounts");
+  let saleDiscount: typeof schema.discounts.$inferSelect | null = null;
+  if (body.discountId) {
+    const d = await db.select().from(schema.discounts)
+      .where(and(eq(schema.discounts.id, body.discountId), eq(schema.discounts.companyId, auth.companyId))).get();
+    if (!d) return c.json({ ok: false, error: "Descuento no encontrado" }, 404);
+    const check = isDiscountAvailable(d as any, location.id);
+    if (!check.ok) return c.json({ ok: false, error: check.reason }, 409);
+    if (d.scope !== "venta") return c.json({ ok: false, error: "Este descuento es por producto, no por venta" }, 400);
+    saleDiscount = d;
+  }
+
   let subtotal = 0;
-  const lineData: { product: typeof schema.products.$inferSelect; qty: number; lineTotal: number }[] = [];
+  const lineData: { product: typeof schema.products.$inferSelect; qty: number; lineTotal: number; lineDiscount: number; discount: typeof schema.discounts.$inferSelect | null }[] = [];
 
   for (const it of items) {
     const product = await db
@@ -130,13 +159,34 @@ sales.post("/", requireModule("pos"), checkLimit("sales"), async (c) => {
     }
 
     const lineTotal = qty * Number(product.price);
+    let lineDiscount = 0;
+    let lineDiscountRow: typeof schema.discounts.$inferSelect | null = null;
+    if ((it as any).discountId) {
+      const d = await db.select().from(schema.discounts)
+        .where(and(eq(schema.discounts.id, (it as any).discountId), eq(schema.discounts.companyId, auth.companyId))).get();
+      if (!d) return c.json({ ok: false, error: "Descuento no encontrado" }, 404);
+      const check = isDiscountAvailable(d as any, location.id);
+      if (!check.ok) return c.json({ ok: false, error: `${product.name}: ${check.reason}` }, 409);
+      if (d.scope !== "producto") return c.json({ ok: false, error: "Este descuento es por venta, no por producto" }, 400);
+      lineDiscount = computeDiscountAmount(d as any, lineTotal, qty);
+      lineDiscountRow = d;
+    }
     subtotal += lineTotal;
-    lineData.push({ product, qty, lineTotal });
+    lineData.push({ product, qty, lineTotal, lineDiscount, discount: lineDiscountRow });
   }
 
+  // Total de la venta = subtotal − descuentos por línea − descuento de venta
+  let saleLevelDiscount = 0;
+  if (saleDiscount) {
+    saleLevelDiscount = computeDiscountAmount(saleDiscount as any, subtotal, undefined);
+  }
+  const lineDiscountsTotal = lineData.reduce((a, l) => a + l.lineDiscount, 0);
+  const totalDiscount = parseFloat((saleLevelDiscount + lineDiscountsTotal).toFixed(2));
+
   const taxRate = Number(company?.taxRate ?? 0);
-  const tax = parseFloat((subtotal * taxRate).toFixed(2));
-  const total = parseFloat((subtotal + tax).toFixed(2));
+  const taxableBase = Math.max(0, subtotal - totalDiscount);
+  const tax = parseFloat((taxableBase * taxRate).toFixed(2));
+  const total = parseFloat((taxableBase + tax).toFixed(2));
 
   // Número de factura atómico — garantiza unicidad bajo concurrencia
   const invoiceNumber = await nextInvoiceNumber(c.env, auth.companyId);
@@ -155,12 +205,14 @@ sales.post("/", requireModule("pos"), checkLimit("sales"), async (c) => {
     subtotal,
     tax,
     total,
+    discountCode: saleDiscount?.code ?? null,
+    discountTotal: totalDiscount,
     currency: (currency || company?.defaultCurrency || "CUP") as any,
     payMethod: payMethod as any,
     status: "emitida",
   });
 
-  for (const { product, qty, lineTotal } of lineData) {
+  for (const { product, qty, lineTotal, lineDiscount, discount } of lineData) {
     await db.insert(schema.saleItems).values({
       id: generateUUID(),
       saleId,
@@ -169,6 +221,8 @@ sales.post("/", requireModule("pos"), checkLimit("sales"), async (c) => {
       qty,
       price: product.price,
       total: lineTotal,
+      discountId: discount?.id ?? null,
+      discountAmount: lineDiscount,
     });
 
     await adjustLocationStock(db, location.id, product.id, -qty);
@@ -182,6 +236,17 @@ sales.post("/", requireModule("pos"), checkLimit("sales"), async (c) => {
       qty,
       reason: `Venta ${invoiceNumber} (${location.name})`,
     });
+  }
+
+  // Incrementar contadores de uso de los descuentos aplicados
+  const usedDiscountIds = new Set<string>();
+  if (saleDiscount) usedDiscountIds.add(saleDiscount.id);
+  for (const l of lineData) if (l.discount) usedDiscountIds.add(l.discount.id);
+  for (const dId of usedDiscountIds) {
+    await db.update(schema.discounts)
+      .set({ usedCount: sql`${schema.discounts.usedCount} + 1` })
+      .where(eq(schema.discounts.id, dId))
+      .run();
   }
 
   const fullItems = await db

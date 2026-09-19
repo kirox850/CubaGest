@@ -69,6 +69,7 @@ auth.post("/register", async (c) => {
     name: string;
     email: string;
     password: string;
+    referralCode?: string;
   }>();
   const { companyName, companyNit, name, email, password } = body;
 
@@ -87,6 +88,8 @@ auth.post("/register", async (c) => {
   planExpiry.setDate(planExpiry.getDate() + 30);
 
   const companyId = generateUUID();
+  // Código de referido propio (único por diseño: prefijo + fragmento de UUID)
+  const referralCode = ("CG" + generateUUID().replace(/-/g, "").slice(0, 6)).toUpperCase();
   await db.insert(schema.companies).values({
     id: companyId,
     name: companyName,
@@ -94,7 +97,31 @@ auth.post("/register", async (c) => {
     plan: "empresarial",
     planExpiry,
     subscriptionStatus: "trial",
+    referralCode,
   });
+
+  // Si se registró con un código de referido, vinculamos el referral
+  // (pendiente hasta que el referido pague un plan → el referente recibe
+  // el mismo plan de regalo 30 días). No bloquea el registro si falla.
+  const refCode = (body.referralCode || "").trim().toUpperCase();
+  if (refCode) {
+    try {
+      const referrer = await db.select().from(schema.companies)
+        .where(eq(schema.companies.referralCode, refCode)).get();
+      if (referrer && referrer.id !== companyId) {
+        await db.update(schema.companies).set({ referredBy: referrer.id })
+          .where(eq(schema.companies.id, companyId));
+        await db.insert(schema.referrals).values({
+          id: generateUUID(),
+          referrerCompanyId: referrer.id,
+          referredCompanyId: companyId,
+          status: "pendiente",
+        });
+      }
+    } catch {
+      // best-effort
+    }
+  }
 
   const passwordHash = await hashPassword(password);
   const userId = generateUUID();

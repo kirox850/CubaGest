@@ -22,6 +22,10 @@ export const companies = sqliteTable("companies", {
   lastPaymentDate: integer("last_payment_date", { mode: "timestamp" }),
   nextPaymentDate: integer("next_payment_date", { mode: "timestamp" }),
   failedAttempts: integer("failed_attempts").notNull().default(0),
+  // Programa de referidos: código único de esta empresa para invitar a
+  // otras (columnas añadidas en migration 0005).
+  referralCode: text("referral_code"),
+  referredBy: text("referred_by"),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
 });
 
@@ -45,6 +49,8 @@ export const products = sqliteTable("products", {
   id: text("id").primaryKey(),
   companyId: text("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
   code: text("code").notNull(),
+  barcode: text("barcode"), // código de barras opcional (escaneable en el POS)
+  currency: text("currency").notNull().default("CUP"), // moneda del precio
   name: text("name").notNull(),
   category: text("category").notNull().default("Otros"),
   unit: text("unit").notNull().default("ud"),
@@ -146,8 +152,13 @@ export const sales = sqliteTable("sales", {
   subtotal: real("subtotal").notNull(),
   tax: real("tax").notNull().default(0),
   total: real("total").notNull(),
-  currency: text("currency", { enum: ["CUP", "MLC", "USD"] }).notNull().default("CUP"),
-  payMethod: text("pay_method", { enum: ["efectivo", "mlc", "transferencia", "tarjeta"] }).notNull(),
+  // currency/payMethod: el enum se amplió a nivel DB (0005) — D1/SQLite no
+  // fuerza enums en runtime, la validación real está en la ruta de sales.
+  currency: text("currency").notNull().default("CUP"),
+  payMethod: text("pay_method").notNull(),
+  // Descuento aplicado al TOTAL de la venta (ya restado de `total`).
+  discountCode: text("discount_code"),
+  discountTotal: real("discount_total").notNull().default(0),
   status: text("status", { enum: ["emitida", "anulada"] }).notNull().default("emitida"),
   syncedAt: integer("synced_at", { mode: "timestamp" }),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
@@ -166,6 +177,9 @@ export const saleItems = sqliteTable("sale_items", {
   qty: real("qty").notNull(),
   price: real("price").notNull(),
   total: real("total").notNull(),
+  // Descuento aplicado a esta línea (ya restado del total de la venta)
+  discountId: text("discount_id").references(() => discounts.id, { onDelete: "set null" }),
+  discountAmount: real("discount_amount").notNull().default(0),
 });
 
 export const expenses = sqliteTable("expenses", {
@@ -275,3 +289,63 @@ export const counters = sqliteTable("counters", {
   id: text("id").primaryKey(),
   value: integer("value").notNull().default(0),
 });
+
+// ── Descuentos (solo admin crea/elimina) ────────────────────────────────────
+// scope: "producto" → se aplica a una línea del carrito;
+//        "venta"     → se aplica al total de la venta.
+// type:  "porcentaje" (value = %) | "fijo" (value = monto en la moneda de la venta).
+// locationScope: "todas" | "seleccion" (con locationIds).
+export const discounts = sqliteTable("discounts", {
+  id: text("id").primaryKey(),
+  companyId: text("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  code: text("code"),
+  scope: text("scope", { enum: ["producto", "venta"] }).notNull(),
+  type: text("type", { enum: ["porcentaje", "fijo"] }).notNull(),
+  value: real("value").notNull(),
+  maxUses: integer("max_uses"),            // NULL = ilimitado
+  timesUsed: integer("times_used").notNull().default(0),
+  locationScope: text("location_scope", { enum: ["todas", "seleccion"] }).notNull().default("todas"),
+  locationIds: text("location_ids", { mode: "json" }).notNull().$defaultFn(() => []),
+  startsAt: integer("starts_at", { mode: "timestamp" }),
+  endsAt: integer("ends_at", { mode: "timestamp" }),
+  active: integer("active", { mode: "boolean" }).notNull().default(true),
+  createdBy: text("created_by").references(() => users.id, { onDelete: "set null" }),
+  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+}, (table) => ({
+  companyIdx: index("discounts_company_idx").on(table.companyId),
+}));
+
+// ── Configuración de empresa: monedas operadas + modo de tasa de cambio ────
+// currencies: lista de monedas que la empresa opera (mínimo 1, por defecto CUP).
+// rateMode: "manual" (admin fija la tasa) | "eltoque" (se sincroniza desde
+// el API pública de elToque y se cachea en este registro — nunca se le
+// pregunta a elToque en cada venta: la app lee siempre de nuestra DB).
+export const companySettings = sqliteTable("company_settings", {
+  companyId: text("company_id").primaryKey().references(() => companies.id, { onDelete: "cascade" }),
+  currencies: text("currencies", { mode: "json" }).notNull().$defaultFn(() => ["CUP"]),
+  rateMode: text("rate_mode", { enum: ["manual", "eltoque"] }).notNull().default("manual"),
+  manualRates: text("manual_rates", { mode: "json" }).notNull().$defaultFn(() => ({})),
+  elToqueRates: text("eltoque_rates", { mode: "json" }).notNull().$defaultFn(() => ({})),
+  elToqueUpdatedAt: integer("eltoque_updated_at", { mode: "timestamp" }),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+});
+
+// ── Programa de referidos ───────────────────────────────────────────────────
+// Cada empresa tiene un código único (companies.referralCode). Cuando una
+// empresa nueva se registra usando ese código y luego contrata un plan pago,
+// la empresa referente recibe EL MISMO PLAN de regalo 30 días (una vez por
+// cada referido que pague; referidos distintos se acumulan).
+export const referrals = sqliteTable("referrals", {
+  id: text("id").primaryKey(),
+  referrerCompanyId: text("referrer_company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
+  referredCompanyId: text("referred_company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
+  status: text("status", { enum: ["pendiente", "bonificado"] }).notNull().default("pendiente"),
+  bonusPlan: text("bonus_plan"),
+  bonusUntil: integer("bonus_until", { mode: "timestamp" }),
+  bonifiedAt: integer("bonified_at", { mode: "timestamp" }),
+  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+}, (table) => ({
+  referrerIdx: index("referrals_referrer_idx").on(table.referrerCompanyId),
+  referredIdx: uniqueIndex("referrals_referred_idx").on(table.referredCompanyId),
+}));

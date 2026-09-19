@@ -58,6 +58,8 @@ locations.get("/:id/stock", async (c) => {
   const items = products.map(p => ({
     id: p.id,
     code: p.code,
+    barcode: p.barcode,
+    currency: p.currency,
     name: p.name,
     category: p.category,
     unit: p.unit,

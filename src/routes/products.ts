@@ -25,7 +25,11 @@ products.get("/", requireAnyModule("inventario", "pos", "facturacion"), async (c
   if (search) {
     conditions.push(or(
       like(schema.products.name, `%${search}%`),
-      like(schema.products.code, `%${search}%`)
+      like(schema.products.code, `%${search}%`),
+      // Código de barras: el buscador del POS y del inventario también
+      // matchea por aquí (los lectores USB/Bluetooth "escriben" el código
+      // en el buscador, y la cámara web escanea al mismo campo).
+      like(schema.products.barcode, `%${search}%`)
     ));
   }
 
@@ -39,7 +43,7 @@ products.get("/", requireAnyModule("inventario", "pos", "facturacion"), async (c
 products.post("/", requireModule("inventario"), checkLimit("products"), async (c) => {
   const db = drizzle(c.env.DB, { schema });
   const auth = c.get("auth");
-  const body = await c.req.json<{ code: string; name: string; category?: string; unit?: string; price: number; cost?: number; stock?: number; minStock?: number }>();
+  const body = await c.req.json<{ code: string; barcode?: string; currency?: string; name: string; category?: string; unit?: string; price: number; cost?: number; stock?: number; minStock?: number }>();
   const { code, name, category, unit, price, cost, stock, minStock } = body;
 
   if (!code || !name || price === undefined) {
@@ -50,6 +54,8 @@ products.post("/", requireModule("inventario"), checkLimit("products"), async (c
     id: generateUUID(),
     companyId: auth.companyId,
     code, name,
+    barcode: body.barcode?.trim() || null,
+    currency: body.currency || "CUP",
     category: category || "Otros",
     unit: unit || "ud",
     price, cost: cost || 0, stock: 0, minStock: minStock || 0,
@@ -85,7 +91,7 @@ products.put("/:id", requireModule("inventario"), async (c) => {
 
   const body = await c.req.json<Partial<typeof schema.products.$inferInsert>>();
   const updates: Partial<typeof schema.products.$inferInsert> = {};
-  const fields = ["code", "name", "category", "unit", "price", "cost", "minStock", "active"] as const;
+  const fields = ["code", "barcode", "currency", "name", "category", "unit", "price", "cost", "minStock", "active"] as const;
   for (const f of fields) {
     if (body[f] !== undefined) (updates as any)[f] = body[f];
   }
