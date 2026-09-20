@@ -206,6 +206,11 @@ auth.post("/login", async (c) => {
     .where(eq(schema.companies.id, user.companyId))
     .get();
 
+  // Empresa suspendida desde el panel de plataforma → sin login.
+  if (company && !company.active) {
+    return c.json({ ok: false, error: "Esta empresa está suspendida. Contacta a soporte." }, 403);
+  }
+
   await db.update(schema.users).set({ lastLoginAt: new Date() }).where(eq(schema.users.id, user.id));
 
   // Access token de 9 HORAS: offline-first — en Cuba no siempre hay conexión
@@ -252,6 +257,13 @@ auth.post("/refresh", async (c) => {
     .where(eq(schema.refreshTokens.token, refreshToken))
     .get();
   if (!stored) return c.json({ ok: false, error: "Refresh token no encontrado" }, 401);
+
+  // Empresa suspendida → tampoco se renuevan sesiones.
+  const companyRow = await db.select({ active: schema.companies.active })
+    .from(schema.companies).where(eq(schema.companies.id, payload.companyId)).get();
+  if (companyRow && !companyRow.active) {
+    return c.json({ ok: false, error: "Empresa suspendida" }, 403);
+  }
 
   if (stored.expiresAt && new Date(stored.expiresAt) < new Date()) {
     await db.delete(schema.refreshTokens).where(eq(schema.refreshTokens.id, stored.id));

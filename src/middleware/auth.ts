@@ -22,7 +22,12 @@ export const authMiddleware = createMiddleware<{ Bindings: Env }>(async (c, next
   }
 
   try {
-    const payload = await verifyToken(token, c.env.JWT_SECRET);
+    const payload: any = await verifyToken(token, c.env.JWT_SECRET);
+    // Separación de carriles: un token de plataforma NO vale para la API de
+    // empresas (y el middleware de plataforma rechaza los normales).
+    if (payload.type === "platform") {
+      return c.json({ ok: false, error: "Token inválido o expirado" }, 401);
+    }
     c.set("auth", {
       userId: payload.userId,
       companyId: payload.companyId,

@@ -26,6 +26,35 @@ export const companies = sqliteTable("companies", {
   // otras (columnas añadidas en migration 0005).
   referralCode: text("referral_code"),
   referredBy: text("referred_by"),
+  // Notas internas del panel de plataforma (migration 0006) — nunca se
+  // exponen al cliente; solo el super-admin las ve en /panel.
+  internalNotes: text("internal_notes"),
+  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+});
+
+// ── Panel de plataforma (super-admin) — migration 0006 ─────────────────────
+// Identidad separada del login de empresas. Un solo nivel de acceso (eres
+// tú); nada de sub-roles. El token de estas cuentas lleva claim
+// type:"platform" y el middleware normal lo rechaza.
+export const platformAdmins = sqliteTable("platform_admins", {
+  id: text("id").primaryKey(),
+  email: text("email").notNull().unique(),
+  name: text("name").notNull().default("Admin de Plataforma"),
+  passwordHash: text("password_hash").notNull(),
+  lastLoginAt: integer("last_login_at", { mode: "timestamp" }),
+  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+});
+
+// Auditoría del panel, separada del audit_logs de empresas (ese exige
+// company_id NOT NULL y las acciones de plataforma son multi-empresa).
+export const platformAuditLogs = sqliteTable("platform_audit_logs", {
+  id: text("id").primaryKey(),
+  adminId: text("admin_id").references(() => platformAdmins.id, { onDelete: "set null" }),
+  action: text("action").notNull(),
+  entityType: text("entity_type").notNull(),
+  entityId: text("entity_id"),
+  detail: text("detail"),
+  ip: text("ip"),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
 });
 
