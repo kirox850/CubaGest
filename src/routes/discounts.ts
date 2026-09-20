@@ -137,7 +137,7 @@ discounts.put("/:id", requireRole("admin"), async (c) => {
   if (body.name !== undefined) updates.name = body.name.trim();
   if (body.code !== undefined) updates.code = body.code?.trim() || null;
   if (body.type !== undefined) {
-    if (!"porcentaje fijo".includes(body.type) || !["porcentaje", "fijo"].includes(body.type)) {
+    if (!"porcentaje fijo".split(" ").includes(body.type)) {
       return c.json({ ok: false, error: "type inválido" }, 400);
     }
     updates.type = body.type;

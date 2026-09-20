@@ -101,18 +101,30 @@ dashboard.get("/analytics", requireModule("dashboard"), async (c) => {
   }
   const topProducts = Object.values(byProduct).sort((a, b) => b.revenue - a.revenue).slice(0, 5);
 
-  // Tendencia de los últimos 30 días (todos los totales mezclados por día,
-  // para la curva; el detalle por moneda está arriba)
+  // Tendencia diaria — UNA SERIE POR MONEDA (las monedas no se convierten
+  // entre sí); "total" mezclado se mantiene por compatibilidad con clients
+  // antiguos. ?days=N permite pedir de 7 a 365 días (default 30).
+  const days = Math.min(Math.max(parseInt(c.req.query("days") || "30", 10) || 30, 7), 365);
   const trend30: { date: string; total: number }[] = [];
   const dayMap: Record<string, { date: string; total: number }> = {};
-  for (let i = 29; i >= 0; i--) {
+  for (let i = days - 1; i >= 0; i--) {
     const d = new Date(now.getTime() - i * 86400000).toISOString().slice(0, 10);
     dayMap[d] = { date: d, total: 0 };
     trend30.push(dayMap[d]);
   }
+  const trend30ByCurrency: Record<string, { date: string; total: number }[]> = {};
+  for (const cur of currencies) {
+    trend30ByCurrency[cur] = trend30.map((d) => ({ date: d.date, total: 0 }));
+  }
+  const trendIdx: Record<string, number> = {};
+  trend30.forEach((d, i) => { trendIdx[d.date] = i; });
   for (const s of sales) {
     const dk = dayMap[s.date];
     if (dk) dk.total += Number(s.total);
+    const cur = s.currency || "CUP";
+    const arr = trend30ByCurrency[cur];
+    const idx = trendIdx[s.date];
+    if (arr && idx !== undefined) arr[idx].total += Number(s.total);
   }
 
   // Productos muertos: activos con stock y sin ninguna venta en 30 días
@@ -132,6 +144,8 @@ dashboard.get("/analytics", requireModule("dashboard"), async (c) => {
       revenueByCurrency,
       topProducts,
       trend30,
+      trend30ByCurrency,
+      currencies,
       deadProducts,
     },
   });
