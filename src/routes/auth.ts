@@ -10,26 +10,44 @@ import { hashToken } from "../lib/tokens";
 
 const auth = new Hono<{ Bindings: Env }>();
 
-// Rate limiting en D1 (no en memoria — Workers son stateless)
-// Clave: "ratelimit:{ip}:{ventana_de_15min}"
-// Límite: 5 intentos por ventana de 15 minutos por IP
-async function checkRateLimit(ip: string, env: Env): Promise<boolean> {
-  const windowSecs = 15 * 60;
-  const now = Math.floor(Date.now() / 1000);
-  const window = Math.floor(now / windowSecs);
-  const key = `ratelimit:${ip}:${window}`;
+// ── Rate limiting en D1 (no en memoria — Workers son stateless) ──────────────
+// DOS contadores por ventana de 15 minutos:
+//  - por CUENTA (email): 8 intentos fallidos — protege cada cuenta individual
+//  - por IP: 40 intentos fallidos — bloquea abuso distribuido sin castigar a
+//    los clientes legítimos que comparten CGNAT de ETECSA (cientos de personas
+//    salen por la misma IP pública; el límite viejo de 5 por IP los bloqueaba).
+// IMPORTANTE: solo cuentan los intentos FALLIDOS — un login correcto nunca
+// consume cupo, así que una tienda con varios cajeros no se auto-bloquea.
+const RL_WINDOW_SECS = 15 * 60;
+const RL_ACCT_LIMIT = 8;
+const RL_IP_LIMIT = 40;
 
+const rlWin = () => Math.floor(Date.now() / 1000 / RL_WINDOW_SECS);
+const rlIpKey = (ip: string) => `ratelimit:ip:${ip}:${rlWin()}`;
+const rlAcctKey = (email: string) => `ratelimit:acct:${email.toLowerCase().trim()}:${rlWin()}`;
+
+async function rlCount(env: Env, key: string): Promise<number> {
+  const row = await env.DB.prepare(`SELECT value FROM counters WHERE id = ?`).bind(key).first<{ value: number }>();
+  return row?.value ?? 0;
+}
+
+async function rlBump(env: Env, key: string): Promise<void> {
   await env.DB.prepare(
     `INSERT INTO counters (id, value)
      VALUES (?, 1)
      ON CONFLICT(id) DO UPDATE SET value = value + 1`
   ).bind(key).run();
+}
 
-  const row = await env.DB.prepare(
-    `SELECT value FROM counters WHERE id = ?`
-  ).bind(key).first<{ value: number }>();
-
-  return (row?.value ?? 0) <= 5;
+// Devuelve null si puede intentarlo, o el mensaje de bloqueo si no.
+async function checkRateLimit(env: Env, ip: string, email?: string): Promise<string | null> {
+  if ((await rlCount(env, rlIpKey(ip))) > RL_IP_LIMIT) {
+    return "Demasiados intentos desde tu conexión. Espera 15 minutos e inténtalo de nuevo.";
+  }
+  if (email && (await rlCount(env, rlAcctKey(email))) > RL_ACCT_LIMIT) {
+    return "Demasiados intentos fallidos para esta cuenta. Espera 15 minutos o restablece tu contraseña.";
+  }
+  return null;
 }
 
 function publicUser(
@@ -149,32 +167,38 @@ auth.post("/register", async (c) => {
 // POST /auth/login
 auth.post("/login", async (c) => {
   const ip = c.req.header("CF-Connecting-IP") || "unknown";
-
-  if (!(await checkRateLimit(ip, c.env))) {
-    return c.json({ ok: false, error: "Demasiados intentos. Intente de nuevo en 15 minutos." }, 429);
-  }
-
   const db = drizzle(c.env.DB, { schema });
   const body = await c.req.json<{ email: string; password: string }>();
   const { email, password } = body;
 
   if (!email || !password) {
-    return c.json({ ok: false, error: "Correo y contraseña requeridos" }, 400);
+    return c.json({ ok: false, error: "Escribe tu correo y tu contraseña para entrar." }, 400);
   }
+
+  const blocked = await checkRateLimit(c.env, ip, email);
+  if (blocked) return c.json({ ok: false, error: blocked }, 429);
 
   const user = await db
     .select()
     .from(schema.users)
     .where(and(eq(schema.users.email, email), eq(schema.users.active, true)))
     .get();
-  if (!user) return c.json({ ok: false, error: "Credenciales incorrectas" }, 401);
+  if (!user) {
+    await rlBump(c.env, rlIpKey(ip));
+    await rlBump(c.env, rlAcctKey(email));
+    return c.json({ ok: false, error: "Correo o contraseña incorrectos. Revisa ambos e inténtalo de nuevo." }, 401);
+  }
 
   if (user.passwordHash === PENDING_ACTIVATION) {
     return c.json({ ok: false, error: "Esta cuenta todavía no tiene contraseña. Revisa el correo con el link para activarla, o pide que te lo reenvíen." }, 401);
   }
 
   const valid = await comparePassword(password, user.passwordHash);
-  if (!valid) return c.json({ ok: false, error: "Credenciales incorrectas" }, 401);
+  if (!valid) {
+    await rlBump(c.env, rlIpKey(ip));
+    await rlBump(c.env, rlAcctKey(email));
+    return c.json({ ok: false, error: "Correo o contraseña incorrectos. Revisa ambos e inténtalo de nuevo." }, 401);
+  }
 
   const company = await db
     .select()
@@ -268,15 +292,18 @@ auth.get("/me", authMiddleware, async (c) => {
 // para averiguar qué correos están registrados.
 auth.post("/forgot-password", async (c) => {
   const ip = c.req.header("CF-Connecting-IP") || "unknown";
-  if (!(await checkRateLimit(ip, c.env))) {
-    return c.json({ ok: false, error: "Demasiados intentos. Intente de nuevo en 15 minutos." }, 429);
-  }
-
   const db = drizzle(c.env.DB, { schema });
   const body = await c.req.json<{ email: string }>().catch(() => ({} as { email: string }));
   const genericResponse = { ok: true, message: "Si el correo existe en nuestro sistema, te llegará un link para restablecer tu contraseña." };
 
+  const blocked = await checkRateLimit(c.env, ip, body.email);
+  if (blocked) return c.json({ ok: false, error: blocked }, 429);
+
   if (!body.email) return c.json(genericResponse);
+
+  // Cada solicitud consume cupo (no hay "intento fallido" que verificar aquí)
+  await rlBump(c.env, rlIpKey(ip));
+  await rlBump(c.env, rlAcctKey(body.email));
 
   const user = await db.select().from(schema.users)
     .where(and(eq(schema.users.email, body.email), eq(schema.users.active, true))).get();
