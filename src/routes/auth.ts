@@ -158,7 +158,7 @@ auth.post("/register", async (c) => {
   const token = await signToken(
     { sub: user.id, userId: user.id, companyId, role: user.role },
     c.env.JWT_SECRET,
-    8 * 3600
+    9 * 3600
   );
 
   return c.json({ ok: true, token, user: publicUser(user, company) }, 201);
@@ -208,10 +208,13 @@ auth.post("/login", async (c) => {
 
   await db.update(schema.users).set({ lastLoginAt: new Date() }).where(eq(schema.users.id, user.id));
 
+  // Access token de 9 HORAS: offline-first — en Cuba no siempre hay conexión
+  // para volver a hacer login o refrescar, y una sesión que muere a media
+  // jornada rompe la venta. El refresh token (7 días) sigue como respaldo.
   const accessToken = await signToken(
     { sub: user.id, userId: user.id, companyId: user.companyId, role: user.role },
     c.env.JWT_SECRET,
-    3600
+    9 * 3600
   );
   const refreshToken = await signToken(
     { sub: user.id, userId: user.id, companyId: user.companyId, role: user.role, jti: generateUUID() },
@@ -255,10 +258,11 @@ auth.post("/refresh", async (c) => {
     return c.json({ ok: false, error: "Refresh token expirado" }, 401);
   }
 
+  // Misma vida de 9h que el login (ver comentario arriba).
   const newAccessToken = await signToken(
     { sub: payload.sub, userId: payload.userId, companyId: payload.companyId, role: payload.role },
     c.env.JWT_SECRET,
-    3600
+    9 * 3600
   );
   return c.json({ ok: true, accessToken: newAccessToken });
 });
