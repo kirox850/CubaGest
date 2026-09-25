@@ -3,17 +3,19 @@ import { eq, and } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import * as schema from "../db/schema";
 import { authMiddleware } from "../middleware/auth";
-import { generateUUID } from "../lib/jwt";
+import { requireAnyModule } from "../middleware/roles";
 import { logAudit, getClientIp } from "../lib/audit";
-import { adjustLocationStock, getLocationStockQty } from "../lib/locations";
+import { adjustLocationStock, StockInsufficientError, getActiveCompanyLocation } from "../lib/locations";
+import { stockMovementStmt, runBatch } from "../lib/batch";
 
 const locations = new Hono<{ Bindings: Env }>();
 
 locations.use("*", authMiddleware);
 
 // Devuelve true si el usuario puede ver/operar la ubicación dada:
-// admin siempre; almacenista solo el almacén; cajero solo su propia caja.
-async function canAccessLocation(db: ReturnType<typeof drizzle>, auth: any, location: typeof schema.inventoryLocations.$inferSelect) {
+// admin siempre (dentro de su empresa); almacenista solo el almacén; cajero
+// solo su propia caja. El contador no opera inventario: no entra.
+async function canAccessLocation(auth: { userId: string; role: string }, location: typeof schema.inventoryLocations.$inferSelect) {
   if (auth.role === "admin") return true;
   if (auth.role === "almacenista") return location.type === "almacen";
   if (auth.role === "cajero") return location.type === "caja" && location.ownerUserId === auth.userId;
@@ -24,7 +26,7 @@ async function canAccessLocation(db: ReturnType<typeof drizzle>, auth: any, loca
 // ubicaciones de la empresa, visible para cualquier usuario autenticado —
 // es lo que se necesita para elegir un destino al crear un envío. El STOCK
 // de cada ubicación es lo que de verdad está restringido (ver /:id/stock).
-locations.get("/", async (c) => {
+locations.get("/", requireAnyModule("inventario", "pos", "facturacion", "cierre", "transferencias"), async (c) => {
   const db = drizzle(c.env.DB, { schema });
   const auth = c.get("auth");
   const rows = await db.select().from(schema.inventoryLocations)
@@ -36,15 +38,14 @@ locations.get("/", async (c) => {
 // Esto es lo que usan Inventario (almacén/caja) y el POS para saber qué hay
 // realmente disponible para vender/gestionar ahí — nunca el total de la
 // empresa.
-locations.get("/:id/stock", async (c) => {
+locations.get("/:id/stock", requireAnyModule("inventario", "pos", "facturacion"), async (c) => {
   const db = drizzle(c.env.DB, { schema });
   const auth = c.get("auth");
   const id = c.req.param("id");
 
-  const location = await db.select().from(schema.inventoryLocations)
-    .where(and(eq(schema.inventoryLocations.id, id), eq(schema.inventoryLocations.companyId, auth.companyId))).get();
+  const location = await getActiveCompanyLocation(db, auth.companyId, id);
   if (!location) return c.json({ ok: false, error: "Ubicación no encontrada" }, 404);
-  if (!(await canAccessLocation(db, auth, location))) {
+  if (!(await canAccessLocation(auth, location))) {
     return c.json({ ok: false, error: "No tiene permisos para ver esta ubicación" }, 403);
   }
 
@@ -74,24 +75,23 @@ locations.get("/:id/stock", async (c) => {
 });
 
 // POST /locations/:id/adjust — ajuste manual de stock (entrada/salida) en
-// una ubicación puntual. Reemplaza al viejo /products/:id/adjust-stock, que
-// operaba sobre un único stock global sin sentido ahora que hay varias
-// ubicaciones.
-locations.post("/:id/adjust", async (c) => {
+// una ubicación puntual. El ajuste y su movimiento se escriben juntos: o queda
+// el stock y el movimiento, o no queda ninguno.
+locations.post("/:id/adjust", requireAnyModule("inventario", "pos"), async (c) => {
   const db = drizzle(c.env.DB, { schema });
   const auth = c.get("auth");
   const id = c.req.param("id");
 
-  const location = await db.select().from(schema.inventoryLocations)
-    .where(and(eq(schema.inventoryLocations.id, id), eq(schema.inventoryLocations.companyId, auth.companyId))).get();
+  const location = await getActiveCompanyLocation(db, auth.companyId, id);
   if (!location) return c.json({ ok: false, error: "Ubicación no encontrada" }, 404);
-  if (!(await canAccessLocation(db, auth, location))) {
+  if (!(await canAccessLocation(auth, location))) {
     return c.json({ ok: false, error: "No tiene permisos para ajustar esta ubicación" }, 403);
   }
 
   const body = await c.req.json<{ productId: string; type: "entrada" | "salida"; qty: number; reason?: string }>();
   const { productId, type, qty, reason } = body;
-  if (!productId || !["entrada", "salida"].includes(type) || !qty || qty <= 0) {
+  const qtyNum = Number(qty);
+  if (!productId || !["entrada", "salida"].includes(type) || !Number.isFinite(qtyNum) || qtyNum <= 0) {
     return c.json({ ok: false, error: "productId, type (entrada|salida) y qty > 0 son requeridos" }, 400);
   }
 
@@ -99,23 +99,27 @@ locations.post("/:id/adjust", async (c) => {
     .where(and(eq(schema.products.id, productId), eq(schema.products.companyId, auth.companyId))).get();
   if (!product) return c.json({ ok: false, error: "Producto no encontrado" }, 404);
 
-  const delta = type === "entrada" ? qty : -qty;
   let newQty: number;
   try {
-    newQty = await adjustLocationStock(db, id, productId, delta);
-  } catch (err: any) {
-    return c.json({ ok: false, error: err.message }, 409);
+    newQty = await adjustLocationStock(c.env, id, productId, type === "entrada" ? qtyNum : -qtyNum);
+  } catch (err) {
+    if (err instanceof StockInsufficientError) {
+      return c.json({ ok: false, error: `Stock insuficiente en ${location.name}` }, 409);
+    }
+    throw err;
   }
 
-  await db.insert(schema.stockMovements).values({
-    id: generateUUID(),
-    companyId: auth.companyId,
-    productId,
-    userId: auth.userId,
-    type,
-    qty,
-    reason: reason ? `[${location.name}] ${reason}` : `Ajuste manual en ${location.name}`,
-  });
+  await runBatch(c.env.DB, [
+    stockMovementStmt(c.env.DB, {
+      companyId: auth.companyId,
+      productId,
+      userId: auth.userId,
+      locationId: id,
+      type,
+      qty: qtyNum,
+      reason: reason ? `[${location.name}] ${reason}` : `Ajuste manual en ${location.name}`,
+    }),
+  ]);
 
   await logAudit(c.env, {
     companyId: auth.companyId,
@@ -123,7 +127,7 @@ locations.post("/:id/adjust", async (c) => {
     action: "location.adjust_stock",
     entity: "location_stock",
     entityId: id,
-    detail: { locationName: location.name, productId, productName: product.name, type, qty, reason: reason || null, newQty },
+    detail: { locationName: location.name, productId, productName: product.name, type, qty: qtyNum, reason: reason || null, newQty },
     ip: getClientIp(c),
   });
 

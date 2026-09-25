@@ -6,6 +6,28 @@ import { sendEmail, setPasswordEmailHtml } from "./email";
 
 const TOKEN_TTL_HOURS = 48;
 
+// Contraseñas: una sola regla para todos los caminos que las escriben
+// (registro, "establecer contraseña" y "olvidé mi contraseña"). Antes cada
+// ruta tenía su propio `length < 8` — o ninguno.
+export const MIN_PASSWORD_LENGTH = 8;
+export const MAX_PASSWORD_LENGTH = 200;
+
+export function validatePassword(password: unknown): { ok: true } | { ok: false; error: string } {
+  if (typeof password !== "string" || password.length === 0) {
+    return { ok: false, error: "La contraseña es requerida" };
+  }
+  if (password.length < MIN_PASSWORD_LENGTH) {
+    return { ok: false, error: `La contraseña debe tener al menos ${MIN_PASSWORD_LENGTH} caracteres` };
+  }
+  if (password.length > MAX_PASSWORD_LENGTH) {
+    return { ok: false, error: `La contraseña no puede superar los ${MAX_PASSWORD_LENGTH} caracteres` };
+  }
+  if (!password.trim()) {
+    return { ok: false, error: "La contraseña no puede ser solo espacios" };
+  }
+  return { ok: true };
+}
+
 // Marcador de "cuenta creada, todavía sin contraseña propia". No es un hash
 // pbkdf2 válido, así que comparePassword() nunca lo va a aceptar como
 // contraseña real — no hace falta tocar la restricción NOT NULL de la

@@ -3,61 +3,26 @@ import { eq, and, desc } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import * as schema from "../db/schema";
 import { authMiddleware } from "../middleware/auth";
-import { requireRole } from "../middleware/roles";
+import { requireRole, requireAnyModule } from "../middleware/roles";
 import { generateUUID } from "../lib/jwt";
 import { logAudit, getClientIp } from "../lib/audit";
+
+// Las reglas puras (validación y cálculo) viven en lib/discountRules para que
+// las ventas online y la sincronización offline usen el mismo código. Se
+// reexportan aquí porque ya son parte del contrato de este módulo.
+export { isDiscountAvailable, computeDiscountAmount, type DiscountRow } from "../lib/discountRules";
 
 const discounts = new Hono<{ Bindings: Env }>();
 
 discounts.use("*", authMiddleware);
 
-// ── Validación de disponibilidad (compartida con sales) ─────────────────────
-export interface DiscountRow {
-  id: string;
-  companyId: string;
-  name: string;
-  code: string | null;
-  scope: "producto" | "venta";
-  type: "porcentaje" | "fijo";
-  value: number;
-  maxUses: number | null;
-  timesUsed: number;
-  locationScope: "todas" | "seleccion";
-  locationIds: string[];
-  startsAt: Date | null;
-  endsAt: Date | null;
-  active: boolean;
-}
-
-// ¿Está disponible este descuento para usar en la ubicación dada?
-export function isDiscountAvailable(d: DiscountRow, locationId: string, now = new Date()): { ok: boolean; reason?: string } {
-  if (!d.active) return { ok: false, reason: "Descuento inactivo" };
-  const endsAt = d.endsAt ? new Date(d.endsAt as any) : null;
-  if (d.startsAt && now < new Date(d.startsAt as any)) return { ok: false, reason: "Descuento aún no vigente" };
-  if (endsAt && now > endsAt) return { ok: false, reason: "Descuento vencido" };
-  if (d.maxUses !== null && d.maxUses !== undefined && d.timesUsed >= d.maxUses) {
-    return { ok: false, reason: "Descuento agotado" };
-  }
-  if (d.locationScope === "seleccion" && !(d.locationIds || []).includes(locationId)) {
-    return { ok: false, reason: "No disponible en esta ubicación" };
-  }
-  return { ok: true };
-}
-
-// ── Cálculo del descuento ────────────────────────────────────────────────────
-export function computeDiscountAmount(d: DiscountRow, base: number, qty?: number): number {
-  let amount = 0;
-  if (d.type === "porcentaje") {
-    amount = base * (d.value / 100);
-  } else {
-    // "fijo": por unidad cuando es por producto, total cuando es por venta
-    amount = d.scope === "producto" ? d.value * (qty || 1) : d.value;
-  }
-  return Math.max(0, Math.min(amount, base));
-}
+// ── Validación de disponibilidad y cálculo ───────────────────────────────────
+// (implementados en lib/discountRules y reexportados arriba)
 
 // ── Listado ──────────────────────────────────────────────────────────────────
-discounts.get("/", async (c) => {
+// Lo leen el POS y la facturación (para aplicar un descuento al vender), no el
+// contador: por eso el módulo no es de libre acceso.
+discounts.get("/", requireAnyModule("pos", "facturacion", "inventario"), async (c) => {
   const db = drizzle(c.env.DB, { schema });
   const auth = c.get("auth");
   const rows = await db.select().from(schema.discounts)

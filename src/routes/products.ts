@@ -7,7 +7,8 @@ import { requireModule, requireAnyModule } from "../middleware/roles";
 import { checkLimit } from "../middleware/plans";
 import { generateUUID } from "../lib/jwt";
 import { logAudit, getClientIp } from "../lib/audit";
-import { getAlmacenLocation, adjustLocationStock } from "../lib/locations";
+import { ensureAlmacenLocation, adjustLocationStock } from "../lib/locations";
+import { stockMovementStmt, runBatch } from "../lib/batch";
 
 const products = new Hono<{ Bindings: Env }>();
 
@@ -49,31 +50,70 @@ products.post("/", requireModule("inventario"), checkLimit("products"), async (c
   if (!code || !name || price === undefined) {
     return c.json({ ok: false, error: "code, name y price son requeridos" }, 400);
   }
+  const priceNum = Number(price);
+  if (!Number.isFinite(priceNum) || priceNum < 0) {
+    return c.json({ ok: false, error: "price debe ser un número >= 0" }, 400);
+  }
+  const initialStock = Number(stock ?? 0);
+  if (!Number.isFinite(initialStock) || initialStock < 0) {
+    return c.json({ ok: false, error: "stock debe ser un número >= 0" }, 400);
+  }
+
+  // Todo producto nuevo nace en el Almacén Central — de ahí se reparte a las
+  // cajas mediante envíos. `ensureAlmacenLocation` crea el almacén si la
+  // empresa no lo tuviera (empresas viejas o registros a medias): antes, sin
+  // almacén, el stock inicial se guardaba en products.stock y NO existía en
+  // ninguna caja, y la venta la rechazaba por falta de existencias.
+  const almacen = await ensureAlmacenLocation(db, auth.companyId);
+  if (!almacen) {
+    return c.json(
+      { ok: false, error: "No se pudo obtener el Almacén Central de la empresa. Contacte a soporte." },
+      500
+    );
+  }
 
   const product = await db.insert(schema.products).values({
     id: generateUUID(),
     companyId: auth.companyId,
     code, name,
     barcode: body.barcode?.trim() || null,
-    currency: body.currency || "CUP",
+    currency: (body.currency || "CUP").toUpperCase(),
     category: category || "Otros",
     unit: unit || "ud",
-    price, cost: cost || 0, stock: 0, minStock: minStock || 0,
+    price: priceNum, cost: Number(cost) || 0, stock: 0, minStock: Number(minStock) || 0,
   }).returning().get();
 
-  // Todo producto nuevo nace en el Almacén Central — de ahí se reparte a
-  // las cajas mediante envíos. El stock inicial que se indique en el
-  // formulario se siembra directamente ahí.
-  const almacen = await getAlmacenLocation(db, auth.companyId);
-  if (almacen && Number(stock) > 0) {
-    await adjustLocationStock(db, almacen.id, product.id, Number(stock), { allowNegative: true });
+  // El stock inicial se siembra en el almacén y deja movimiento de inventario:
+  // si no se puede sembrar, se falla claramente en vez de crear un producto
+  // que no se puede vender.
+  if (initialStock > 0) {
+    try {
+      await adjustLocationStock(c.env, almacen.id, product.id, initialStock, { allowNegative: true });
+      await runBatch(c.env.DB, [
+        stockMovementStmt(c.env.DB, {
+          companyId: auth.companyId,
+          productId: product.id,
+          userId: auth.userId,
+          locationId: almacen.id,
+          type: "entrada",
+          qty: initialStock,
+          reason: `Stock inicial en ${almacen.name}`,
+        }),
+      ]);
+    } catch (err) {
+      console.error("products: no se pudo sembrar el stock inicial:", err);
+      return c.json(
+        { ok: false, error: "El producto se creó pero no se pudo registrar el stock inicial. Revise el Almacén Central.", code: "INITIAL_STOCK_FAILED" },
+        500
+      );
+    }
   }
   const finalProduct = await db.select().from(schema.products).where(eq(schema.products.id, product.id)).get();
 
   await logAudit(c.env, {
     companyId: auth.companyId, userId: auth.userId,
     action: "product.create", entity: "product", entityId: product.id,
-    detail: { code, name, price, initialStock: stock || 0 },
+    detail: { code, name, price: priceNum, initialStock, location: almacen.name },
     ip: getClientIp(c),
   });
 

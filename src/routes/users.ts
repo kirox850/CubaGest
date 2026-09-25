@@ -126,7 +126,7 @@ users.put("/:id", requireModule("usuarios"), async (c) => {
   if (roleChanging && user.role === "cajero" && body.role !== "cajero") {
     const caja = await getCajaLocationForUser(db, auth.companyId, user.id);
     if (caja) {
-      const { itemsReturned } = await returnAllStockToAlmacen(db, auth.companyId, caja.id, auth.userId, `Cambio de rol de ${user.name} (${user.role} → ${body.role})`);
+      const { itemsReturned } = await returnAllStockToAlmacen(db, c.env, auth.companyId, caja.id, auth.userId, `Cambio de rol de ${user.name} (${user.role} → ${body.role})`);
       await db.update(schema.inventoryLocations).set({ active: false }).where(eq(schema.inventoryLocations.id, caja.id));
       if (itemsReturned > 0) {
         await logAudit(c.env, {
@@ -187,7 +187,7 @@ users.delete("/:id", requireModule("usuarios"), requireRole("admin"), async (c) 
   if (user.role === "cajero") {
     const caja = await getCajaLocationForUser(db, auth.companyId, user.id);
     if (caja) {
-      const { itemsReturned } = await returnAllStockToAlmacen(db, auth.companyId, caja.id, auth.userId, `Baja de ${user.name}`);
+      const { itemsReturned } = await returnAllStockToAlmacen(db, c.env, auth.companyId, caja.id, auth.userId, `Baja de ${user.name}`);
       await db.update(schema.inventoryLocations).set({ active: false }).where(eq(schema.inventoryLocations.id, caja.id));
       if (itemsReturned > 0) {
         await logAudit(c.env, {

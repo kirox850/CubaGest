@@ -188,12 +188,26 @@ export const sales = sqliteTable("sales", {
   // Descuento aplicado al TOTAL de la venta (ya restado de `total`).
   discountCode: text("discount_code"),
   discountTotal: real("discount_total").notNull().default(0),
+  // Id del descuento de nivel venta (0007). Sin esto, al anular una venta no
+  // se podía devolver el uso al contador de ese descuento.
+  discountId: text("discount_id").references(() => discounts.id, { onDelete: "set null" }),
+  // Idempotencia: UUID que genera el CLIENTE (POS web o cola offline). El
+  // índice único (company_id, client_sale_id) de la migration 0007 hace que
+  // reenviar la misma venta devuelva la factura original en vez de duplicarla.
+  // NULL = venta creada antes de esta columna (sin idempotencia).
+  clientSaleId: text("client_sale_id"),
   status: text("status", { enum: ["emitida", "anulada"] }).notNull().default("emitida"),
   syncedAt: integer("synced_at", { mode: "timestamp" }),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
 }, (table) => ({
   companyIdx: index("sales_company_idx").on(table.companyId),
   invoiceIdx: uniqueIndex("sales_invoice_idx").on(table.companyId, table.invoiceNumber),
+  // Índice único de idempotencia. En la migration 0007 es PARCIAL
+  // (WHERE client_sale_id IS NOT NULL) para que las ventas sin clientSaleId
+  // (las anteriores a la columna) no choquen entre sí; aquí se declara sin
+  // el WHERE porque solo documenta el acceso y las migraciones de este
+  // proyecto son SQL a mano, no generadas por drizzle-kit.
+  clientSaleIdx: uniqueIndex("sales_client_sale_idx").on(table.companyId, table.clientSaleId),
   dateIdx: index("sales_date_idx").on(table.date),
   statusIdx: index("sales_status_idx").on(table.status),
 }));
@@ -231,6 +245,9 @@ export const stockMovements = sqliteTable("stock_movements", {
   companyId: text("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
   productId: text("product_id").notNull().references(() => products.id, { onDelete: "cascade" }),
   userId: text("user_id").references(() => users.id, { onDelete: "set null" }),
+  // Dónde ocurrió el movimiento (0007). Sin esto no se puede saber en qué caja
+  // se descontó o se devolvió el stock. NULL en los movimientos históricos.
+  locationId: text("location_id").references(() => inventoryLocations.id, { onDelete: "set null" }),
   type: text("type", { enum: ["entrada", "salida", "venta", "ajuste"] }).notNull(),
   qty: real("qty").notNull(),
   reason: text("reason"),
@@ -238,6 +255,7 @@ export const stockMovements = sqliteTable("stock_movements", {
 }, (table) => ({
   companyIdx: index("sm_company_idx").on(table.companyId),
   productIdx: index("sm_product_idx").on(table.productId),
+  locationIdx: index("sm_location_idx").on(table.locationId),
 }));
 
 export const inventoryReadings = sqliteTable("inventory_readings", {
@@ -261,6 +279,10 @@ export const cashClosings = sqliteTable("cash_closings", {
   closedById: text("closed_by_id").notNull().references(() => users.id, { onDelete: "cascade" }),
   initialReadingId: text("initial_reading_id").notNull().references(() => inventoryReadings.id),
   closingReadingId: text("closing_reading_id").references(() => inventoryReadings.id),
+  // 0007: una lectura de apertura solo puede confirmarse una vez. Es el id de
+  // esa lectura; el índice único parcial (WHERE confirm_key IS NOT NULL)
+  // mantiene NULL en los cierres históricos, sin borrarlos.
+  confirmKey: text("confirm_key"),
   periodStart: integer("period_start", { mode: "timestamp" }).notNull(),
   periodEnd: integer("period_end", { mode: "timestamp" }).notNull(),
   totalSales: integer("total_sales").notNull().default(0),
@@ -287,10 +309,25 @@ export const auditLogs = sqliteTable("audit_logs", {
 export const refreshTokens = sqliteTable("refresh_tokens", {
   id: text("id").primaryKey(),
   userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  // Columna legacy (NOT NULL por el esquema 0001): desde 0007 el refresh token
+  // se guarda hasheado en `tokenHash` y aquí va un marcador "sha256:<hash>".
+  // Solo las filas anteriores a 0007 conservan el token en crudo.
   token: text("token").notNull(),
+  tokenHash: text("token_hash"),
   expiresAt: integer("expires_at", { mode: "timestamp" }).notNull(),
+  // Sesión larga y rotante: cada refresh marca esta fila (rotatedAt) y crea
+  // otra con expiración nueva. revokedAt es el fin de la ventana de gracia del
+  // token sustituido; el logout lo revoca de inmediato (rotatedAt = null).
+  rotatedAt: integer("rotated_at", { mode: "timestamp" }),
+  rotatedToHash: text("rotated_to_hash"),
+  revokedAt: integer("revoked_at", { mode: "timestamp" }),
+  lastUsedAt: integer("last_used_at", { mode: "timestamp" }),
+  deviceLabel: text("device_label"),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
-});
+}, (table) => ({
+  hashIdx: index("refresh_tokens_hash_idx").on(table.tokenHash),
+  userIdx: index("refresh_tokens_user_idx").on(table.userId),
+}));
 
 // Tokens de un solo uso para "establecer contraseña" (cuenta nueva) y
 // "olvidé mi contraseña" (cuenta existente) — ambos usan el mismo mecanismo:

@@ -1,0 +1,33 @@
+# ── Dependencias y builds ────────────────────────────────────────────────────
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+
+# ── Cloudflare Wrangler / D1 ────────────────────────────────────────────────
+# Estado local de wrangler (incluye las bases D1 locales con datos REALES).
+.wrangler/
+# .dev.vars guarda JWT_SECRET y las claves de QvaPay/elToque: NUNCA al repo.
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+# Copias locales de la base.
+*.sqlite
+*.sqlite3
+*.db
+
+# ── Secretos ────────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Logs, cobertura y sistema ───────────────────────────────────────────────
+*.log
+npm-debug.*
+yarn-error.*
+coverage/
+.DS_Store
+Thumbs.db
+
+# Los scripts de verificación (scripts/p0_*.mjs) SÍ se versionan a propósito:
+# son pruebas de integridad ejecutables sin instalar nada.

@@ -5,6 +5,7 @@ import * as schema from "../db/schema";
 import { authMiddleware } from "../middleware/auth";
 import { requireRole } from "../middleware/roles";
 import { logAudit, getClientIp } from "../lib/audit";
+import { ensureCompanySettings } from "../lib/companySettings";
 
 const settings = new Hono<{ Bindings: Env }>();
 
@@ -162,12 +163,9 @@ export async function getExchangeRates(
 settings.get("/", async (c) => {
   const db = drizzle(c.env.DB, { schema });
   const auth = c.get("auth");
-  let s = await db.select().from(schema.companySettings)
-    .where(eq(schema.companySettings.companyId, auth.companyId)).get();
-  if (!s) {
-    // Defaults: solo CUP, tasa manual.
-    s = await db.insert(schema.companySettings).values({ companyId: auth.companyId }).returning().get();
-  }
+  // ensureCompanySettings: crea la fila si falta (empresas viejas) con los
+  // defaults ["CUP"] + tasa manual. Es el mismo helper que usa el registro.
+  const s = await ensureCompanySettings(db, auth.companyId);
   // ?refresh=1 fuerza una consulta fresca a elToque (botón "Probar ahora"
   // del panel de Monedas) en vez de servir la caché de 5 minutos.
   const forceRefresh = c.req.query("refresh") === "1";
@@ -194,11 +192,7 @@ settings.put("/", requireRole("admin"), async (c) => {
     manualRates?: Record<string, number>;
   }>();
 
-  let s = await db.select().from(schema.companySettings)
-    .where(eq(schema.companySettings.companyId, auth.companyId)).get();
-  if (!s) {
-    s = await db.insert(schema.companySettings).values({ companyId: auth.companyId }).returning().get();
-  }
+  await ensureCompanySettings(db, auth.companyId);
 
   const updates: Partial<typeof schema.companySettings.$inferInsert> = { updatedAt: new Date() };
 

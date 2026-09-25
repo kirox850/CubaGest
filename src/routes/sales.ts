@@ -1,18 +1,60 @@
 import { Hono } from "hono";
-import { eq, and, gte, lte, sql } from "drizzle-orm";
+import { eq, and, gte, lte, inArray } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import * as schema from "../db/schema";
 import { authMiddleware } from "../middleware/auth";
-import { requireModule } from "../middleware/roles";
-import { checkLimit } from "../middleware/plans";
-import { generateUUID } from "../lib/jwt";
-import { nextInvoiceNumber } from "../lib/invoiceNumber";
-import { logAudit, getClientIp } from "../lib/audit";
-import { resolveOwnLocation, getLocationStockQty, adjustLocationStock } from "../lib/locations";
+import { requireModule, canMutateSale } from "../middleware/roles";
+import { getClientIp } from "../lib/audit";
+import {
+  createSale,
+  voidSale,
+  validateClientSaleId,
+  ALLOWED_PAY_METHODS,
+  type SaleLineInput,
+} from "../lib/sales";
 
 const sales = new Hono<{ Bindings: Env }>();
 
 sales.use("*", authMiddleware);
+
+interface SaleBody {
+  clientSaleId?: string;
+  clientName?: string;
+  clientNit?: string;
+  clientPhone?: string;
+  currency?: string;
+  payMethod?: string;
+  locationId?: string;
+  items?: SaleLineInput[];
+  // Descuento de tipo "venta" (aplicado al total). Los de tipo "producto"
+  // viajan dentro de cada item como discountId.
+  discountId?: string;
+}
+
+function validateBody(body: SaleBody) {
+  if (body.payMethod !== undefined && typeof body.payMethod !== "string") {
+    return "payMethod debe ser texto";
+  }
+  if (body.payMethod && !(ALLOWED_PAY_METHODS as readonly string[]).includes(body.payMethod)) {
+    return "Método de pago inválido";
+  }
+  if (body.items !== undefined && !Array.isArray(body.items)) {
+    return "items debe ser una lista";
+  }
+  if (body.clientName !== undefined && typeof body.clientName !== "string") {
+    return "clientName debe ser texto";
+  }
+  if (body.currency !== undefined && typeof body.currency !== "string") {
+    return "currency debe ser texto";
+  }
+  if (body.discountId !== undefined && body.discountId !== null && typeof body.discountId !== "string") {
+    return "discountId debe ser texto";
+  }
+  if (body.locationId !== undefined && body.locationId !== null && typeof body.locationId !== "string") {
+    return "locationId debe ser texto";
+  }
+  return null;
+}
 
 // FIX: permiso cambiado de "contabilidad" a "facturacion"
 // para que cajeros puedan ver el historial y reimprimir facturas
@@ -33,15 +75,24 @@ sales.get("/", requireModule("facturacion"), async (c) => {
     .orderBy(schema.sales.createdAt)
     .all();
 
-  const result = [];
-  for (const sale of rows) {
-    const items = await db
+  // Una sola consulta para las líneas de todas las ventas de la página, en
+  // vez de una por venta.
+  const saleIds = rows.map((r) => r.id);
+  const itemsBySale = new Map<string, typeof schema.saleItems.$inferSelect[]>();
+  if (saleIds.length > 0) {
+    const allItems = await db
       .select()
       .from(schema.saleItems)
-      .where(eq(schema.saleItems.saleId, sale.id))
+      .where(inArray(schema.saleItems.saleId, saleIds))
       .all();
-    result.push({ ...sale, items });
+    for (const item of allItems) {
+      const list = itemsBySale.get(item.saleId) ?? [];
+      list.push(item);
+      itemsBySale.set(item.saleId, list);
+    }
   }
+
+  const result = rows.map((sale) => ({ ...sale, items: itemsBySale.get(sale.id) ?? [] }));
   return c.json({ ok: true, data: result });
 });
 
@@ -65,199 +116,61 @@ sales.get("/:id", requireModule("facturacion"), async (c) => {
   return c.json({ ok: true, data: { ...sale, items } });
 });
 
-// FIX: usa nextInvoiceNumber atómico para evitar race conditions
-sales.post("/", requireModule("pos"), checkLimit("sales"), async (c) => {
+// POST /sales
+// Todo el cálculo (precio, descuentos, impuesto, total) y toda la escritura
+// (venta, líneas, stock, movimientos, contadores, auditoría) ocurren en el
+// núcleo compartido src/lib/sales.ts, en un único batch atómico de D1.
+//
+// El límite de ventas del plan NO se comprueba aquí con checkLimit("sales"):
+// createSale ya lo evalúa (misma regla, fecha del servidor) DESPUÉS de
+// comprobar la idempotencia, de modo que reenviar una venta ya sincronizada
+// devuelve su factura original en vez de un 403 por límite alcanzado — que es
+// justo lo que pasa cuando el cliente recupera internet con cola offline.
+sales.post("/", requireModule("pos"), async (c) => {
   const db = drizzle(c.env.DB, { schema });
   const auth = c.get("auth");
-  const body = await c.req.json<{
-    clientName?: string;
-    clientNit?: string;
-    clientPhone?: string;
-    currency?: string;
-    payMethod: string;
-    locationId?: string;
-    items: { productId: string; qty: number }[];
-    // Descuento de tipo "venta" (aplicado al total). Los de tipo "producto"
-    // viajan dentro de cada item como discountId.
-    discountId?: string;
-  }>();
+  const body = await c.req.json<SaleBody>().catch(() => null);
+  if (!body) return c.json({ ok: false, error: "Cuerpo de la petición inválido" }, 400);
 
-  const { clientName, clientNit, clientPhone, currency, payMethod, items } = body;
+  const shapeError = validateBody(body);
+  if (shapeError) return c.json({ ok: false, error: shapeError }, 400);
 
-  if (!Array.isArray(items) || items.length === 0) {
-    return c.json({ ok: false, error: "La venta debe tener al menos un producto" }, 400);
-  }
-  if (!payMethod) return c.json({ ok: false, error: "payMethod es requerido" }, 400);
+  // clientSaleId es OPCIONAL aquí (el cliente viejo no lo manda) pero si llega
+  // se valida y activa la idempotencia: reenviar la misma venta devuelve la
+  // factura original en vez de duplicarla.
+  const clientId = validateClientSaleId(body.clientSaleId);
+  if (!clientId.ok) return c.json({ ok: false, error: clientId.error, code: "CLIENT_SALE_ID_INVALID" }, 400);
 
-  // Cada venta descuenta de la caja propia del cajero (o del almacén, si
-  // vende un almacenista) — nunca de un pool global compartido. Un admin
-  // sin ubicación propia debe indicar locationId explícitamente.
-  let location = await resolveOwnLocation(db, auth);
-  if (!location && auth.role === "admin" && body.locationId) {
-    location = await db.select().from(schema.inventoryLocations)
-      .where(and(eq(schema.inventoryLocations.id, body.locationId), eq(schema.inventoryLocations.companyId, auth.companyId))).get() ?? null;
-  }
-  if (!location) return c.json({ ok: false, error: "No tiene una ubicación de venta asignada" }, 400);
+  if (!body.payMethod) return c.json({ ok: false, error: "payMethod es requerido" }, 400);
 
-  const company = await db
-    .select()
-    .from(schema.companies)
-    .where(eq(schema.companies.id, auth.companyId))
-    .get();
-
-  // ── Validación de moneda y método de pago contra la config de empresa ────
-  const ALLOWED_PAY_METHODS = ["efectivo", "transferencia", "usd", "clasica", "zelle", "mlc", "eur", "tarjeta"];
-  if (!ALLOWED_PAY_METHODS.includes(payMethod)) {
-    return c.json({ ok: false, error: "Método de pago inválido" }, 400);
-  }
-  const settingsRow = await db.select().from(schema.companySettings)
-    .where(eq(schema.companySettings.companyId, auth.companyId)).get();
-  const allowedCurrencies: string[] = (settingsRow?.currencies as string[]) || ["CUP"];
-  const saleCurrency = (currency || company?.defaultCurrency || "CUP");
-  if (!allowedCurrencies.includes(saleCurrency)) {
-    return c.json({ ok: false, error: `La moneda ${saleCurrency} no está habilitada para tu negocio` }, 400);
-  }
-
-  // ── Descuentos ──────────────────────────────────────────────────────────
-  const { computeDiscountAmount, isDiscountAvailable } = await import("./discounts");
-  let saleDiscount: typeof schema.discounts.$inferSelect | null = null;
-  if (body.discountId) {
-    const d = await db.select().from(schema.discounts)
-      .where(and(eq(schema.discounts.id, body.discountId), eq(schema.discounts.companyId, auth.companyId))).get();
-    if (!d) return c.json({ ok: false, error: "Descuento no encontrado" }, 404);
-    const check = isDiscountAvailable(d as any, location.id);
-    if (!check.ok) return c.json({ ok: false, error: check.reason }, 409);
-    if (d.scope !== "venta") return c.json({ ok: false, error: "Este descuento es por producto, no por venta" }, 400);
-    saleDiscount = d;
-  }
-
-  let subtotal = 0;
-  const lineData: { product: typeof schema.products.$inferSelect; qty: number; lineTotal: number; lineDiscount: number; discount: typeof schema.discounts.$inferSelect | null }[] = [];
-
-  for (const it of items) {
-    const product = await db
-      .select()
-      .from(schema.products)
-      .where(
-        and(
-          eq(schema.products.id, it.productId),
-          eq(schema.products.companyId, auth.companyId),
-          eq(schema.products.active, true)
-        )
-      )
-      .get();
-    if (!product) return c.json({ ok: false, error: `Producto ${it.productId} no encontrado` }, 404);
-
-    const qty = Number(it.qty);
-    if (!qty || qty <= 0) return c.json({ ok: false, error: `Cantidad inválida para ${product.name}` }, 400);
-    const available = await getLocationStockQty(db, location.id, product.id);
-    if (available < qty) {
-      return c.json(
-        { ok: false, error: `Stock insuficiente para ${product.name} en ${location.name} (disponible: ${available})` },
-        409
-      );
-    }
-
-    const lineTotal = qty * Number(product.price);
-    let lineDiscount = 0;
-    let lineDiscountRow: typeof schema.discounts.$inferSelect | null = null;
-    if ((it as any).discountId) {
-      const d = await db.select().from(schema.discounts)
-        .where(and(eq(schema.discounts.id, (it as any).discountId), eq(schema.discounts.companyId, auth.companyId))).get();
-      if (!d) return c.json({ ok: false, error: "Descuento no encontrado" }, 404);
-      const check = isDiscountAvailable(d as any, location.id);
-      if (!check.ok) return c.json({ ok: false, error: `${product.name}: ${check.reason}` }, 409);
-      if (d.scope !== "producto") return c.json({ ok: false, error: "Este descuento es por venta, no por producto" }, 400);
-      lineDiscount = computeDiscountAmount(d as any, lineTotal, qty);
-      lineDiscountRow = d;
-    }
-    subtotal += lineTotal;
-    lineData.push({ product, qty, lineTotal, lineDiscount, discount: lineDiscountRow });
-  }
-
-  // Total de la venta = subtotal − descuentos por línea − descuento de venta
-  let saleLevelDiscount = 0;
-  if (saleDiscount) {
-    saleLevelDiscount = computeDiscountAmount(saleDiscount as any, subtotal, undefined);
-  }
-  const lineDiscountsTotal = lineData.reduce((a, l) => a + l.lineDiscount, 0);
-  const totalDiscount = parseFloat((saleLevelDiscount + lineDiscountsTotal).toFixed(2));
-
-  const taxRate = Number(company?.taxRate ?? 0);
-  const taxableBase = Math.max(0, subtotal - totalDiscount);
-  const tax = parseFloat((taxableBase * taxRate).toFixed(2));
-  const total = parseFloat((taxableBase + tax).toFixed(2));
-
-  // Número de factura atómico — garantiza unicidad bajo concurrencia
-  const invoiceNumber = await nextInvoiceNumber(c.env, auth.companyId);
-
-  const saleId = generateUUID();
-  await db.insert(schema.sales).values({
-    id: saleId,
-    companyId: auth.companyId,
-    invoiceNumber,
-    userId: auth.userId,
-    locationId: location.id,
-    date: new Date().toISOString().split("T")[0],
-    clientName: clientName || "Consumidor Final",
-    clientNit: clientNit || "00000000000",
-    clientPhone: clientPhone || null,
-    subtotal,
-    tax,
-    total,
-    discountCode: saleDiscount?.code ?? null,
-    discountTotal: totalDiscount,
-    currency: (currency || company?.defaultCurrency || "CUP") as any,
-    payMethod: payMethod as any,
-    status: "emitida",
+  const result = await createSale(c.env, db, auth, {
+    clientSaleId: clientId.value,
+    clientName: body.clientName,
+    clientNit: body.clientNit,
+    clientPhone: body.clientPhone,
+    currency: body.currency,
+    payMethod: body.payMethod,
+    locationId: body.locationId ?? null,
+    items: (body.items ?? []) as SaleLineInput[],
+    discountId: body.discountId ?? null,
+    ip: getClientIp(c),
   });
 
-  for (const { product, qty, lineTotal, lineDiscount, discount } of lineData) {
-    await db.insert(schema.saleItems).values({
-      id: generateUUID(),
-      saleId,
-      productId: product.id,
-      name: product.name,
-      qty,
-      price: product.price,
-      total: lineTotal,
-      discountId: discount?.id ?? null,
-      discountAmount: lineDiscount,
-    });
-
-    await adjustLocationStock(db, location.id, product.id, -qty);
-
-    await db.insert(schema.stockMovements).values({
-      id: generateUUID(),
-      companyId: auth.companyId,
-      productId: product.id,
-      userId: auth.userId,
-      type: "venta",
-      qty,
-      reason: `Venta ${invoiceNumber} (${location.name})`,
-    });
+  if (!result.ok) {
+    return c.json({ ok: false, error: result.error, code: result.code }, result.status as any);
   }
-
-  // Incrementar contadores de uso de los descuentos aplicados
-  const usedDiscountIds = new Set<string>();
-  if (saleDiscount) usedDiscountIds.add(saleDiscount.id);
-  for (const l of lineData) if (l.discount) usedDiscountIds.add(l.discount.id);
-  for (const dId of usedDiscountIds) {
-    await db.update(schema.discounts)
-      .set({ usedCount: sql`${schema.discounts.usedCount} + 1` })
-      .where(eq(schema.discounts.id, dId))
-      .run();
-  }
-
-  const fullItems = await db
-    .select()
-    .from(schema.saleItems)
-    .where(eq(schema.saleItems.saleId, saleId))
-    .all();
-  const fullSale = await db.select().from(schema.sales).where(eq(schema.sales.id, saleId)).get();
-  return c.json({ ok: true, data: { ...fullSale!, items: fullItems } }, 201);
+  return c.json(
+    {
+      ok: true,
+      data: { ...result.sale, items: result.items },
+      duplicate: result.duplicate,
+    },
+    result.duplicate ? 200 : 201
+  );
 });
 
+// PUT /sales/:id — solo datos del cliente y método de pago. Los importes, las
+// líneas y el stock NO se tocan: para eso se anula y se vuelve a vender.
 sales.put("/:id", requireModule("pos"), async (c) => {
   const db = drizzle(c.env.DB, { schema });
   const auth = c.get("auth");
@@ -271,78 +184,80 @@ sales.put("/:id", requireModule("pos"), async (c) => {
   if (!sale) return c.json({ ok: false, error: "Venta no encontrada" }, 404);
   if (sale.status === "anulada") return c.json({ ok: false, error: "No se puede editar una venta anulada" }, 400);
 
+  const perm = canMutateSale(auth, { userId: sale.userId, locationId: sale.locationId });
+  if (!perm.allowed) return c.json({ ok: false, error: perm.reason, code: "SALE_FORBIDDEN" }, 403);
+
   const body = await c.req.json<{
     clientName?: string;
     clientNit?: string;
     clientPhone?: string;
     payMethod?: string;
   }>();
+
+  if (body.payMethod !== undefined && !(ALLOWED_PAY_METHODS as readonly string[]).includes(body.payMethod)) {
+    return c.json({ ok: false, error: "Método de pago inválido" }, 400);
+  }
+
   const updates: Partial<typeof schema.sales.$inferInsert> = {};
   if (body.clientName !== undefined) updates.clientName = body.clientName;
   if (body.clientNit !== undefined) updates.clientNit = body.clientNit;
   if (body.clientPhone !== undefined) updates.clientPhone = body.clientPhone;
   if (body.payMethod !== undefined) updates.payMethod = body.payMethod as any;
 
+  if (Object.keys(updates).length === 0) {
+    return c.json({ ok: false, error: "No hay cambios para guardar" }, 400);
+  }
+
   await db.update(schema.sales).set(updates).where(eq(schema.sales.id, id));
+  await logSaleEdit(c.env, {
+    companyId: auth.companyId,
+    userId: auth.userId,
+    saleId: id,
+    invoiceNumber: sale.invoiceNumber,
+    changes: updates,
+    ip: getClientIp(c),
+  });
 
   const updated = await db.select().from(schema.sales).where(eq(schema.sales.id, id)).get();
   const items = await db.select().from(schema.saleItems).where(eq(schema.saleItems.saleId, id)).all();
   return c.json({ ok: true, data: { ...updated!, items } });
 });
 
-// Anulación — restaura stock automáticamente
+async function logSaleEdit(
+  env: Env,
+  row: {
+    companyId: string;
+    userId: string;
+    saleId: string;
+    invoiceNumber: string;
+    changes: Record<string, unknown>;
+    ip: string | null;
+  }
+) {
+  await env.DB.prepare(
+    `INSERT INTO audit_logs (id, company_id, user_id, action, entity, entity_id, detail, ip, created_at)
+     VALUES (?, ?, ?, 'sale.update', 'sale', ?, ?, ?, unixepoch())`
+  )
+    .bind(
+      crypto.randomUUID(), row.companyId, row.userId, row.saleId,
+      JSON.stringify({ invoiceNumber: row.invoiceNumber, changes: row.changes }),
+      row.ip
+    )
+    .run();
+}
+
+// POST /sales/:id/void — anulación. IDEMPOTENTE: llamarla dos veces devuelve la
+// misma respuesta y devuelve el stock UNA sola vez.
 sales.post("/:id/void", requireModule("pos"), async (c) => {
   const db = drizzle(c.env.DB, { schema });
   const auth = c.get("auth");
   const id = c.req.param("id");
 
-  const sale = await db
-    .select()
-    .from(schema.sales)
-    .where(and(eq(schema.sales.id, id), eq(schema.sales.companyId, auth.companyId)))
-    .get();
-  if (!sale) return c.json({ ok: false, error: "Venta no encontrada" }, 404);
-  if (sale.status === "anulada") return c.json({ ok: false, error: "La venta ya está anulada" }, 400);
-
-  const items = await db
-    .select()
-    .from(schema.saleItems)
-    .where(eq(schema.saleItems.saleId, id))
-    .all();
-
-  for (const item of items) {
-    if (!item.productId) continue;
-    const product = await db
-      .select()
-      .from(schema.products)
-      .where(and(eq(schema.products.id, item.productId), eq(schema.products.companyId, auth.companyId)))
-      .get();
-    if (product && sale.locationId) {
-      await adjustLocationStock(db, sale.locationId, product.id, Number(item.qty), { allowNegative: true });
-
-      await db.insert(schema.stockMovements).values({
-        id: generateUUID(),
-        companyId: auth.companyId,
-        productId: product.id,
-        userId: auth.userId,
-        type: "entrada",
-        qty: Number(item.qty),
-        reason: `Anulación ${sale.invoiceNumber}`,
-      });
-    }
+  const result = await voidSale(c.env, db, auth, id, { ip: getClientIp(c) });
+  if (!result.ok) {
+    return c.json({ ok: false, error: result.error, code: result.code }, result.status as any);
   }
-
-  await db.update(schema.sales).set({ status: "anulada" }).where(eq(schema.sales.id, id));
-
-  await logAudit(c.env, {
-    companyId: auth.companyId, userId: auth.userId,
-    action: "sale.void", entity: "sale", entityId: id,
-    detail: { invoiceNumber: sale.invoiceNumber, total: sale.total },
-    ip: getClientIp(c),
-  });
-
-  const updated = await db.select().from(schema.sales).where(eq(schema.sales.id, id)).get();
-  return c.json({ ok: true, data: updated });
+  return c.json({ ok: true, data: result.sale, alreadyVoided: result.alreadyVoided });
 });
 
 export default sales;

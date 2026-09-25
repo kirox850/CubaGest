@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { eq, and, desc, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import * as schema from "../db/schema";
-import { signToken, verifyToken, generateUUID } from "../lib/jwt";
+import { signToken, verifyToken, generateUUID, SUPPORT_TOKEN_TTL_SECONDS, PLATFORM_TOKEN_TTL_SECONDS } from "../lib/jwt";
 import { hashPassword, comparePassword } from "../lib/hash";
 import { getClientIp } from "../lib/audit";
 import { createMiddleware } from "hono/factory";
@@ -35,8 +35,11 @@ export const platformAuthMiddleware = createMiddleware<{ Bindings: Env }>(async 
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
   if (!token) return c.json({ ok: false, error: "Token no proporcionado" }, 401);
   try {
-    const payload: any = await verifyToken(token, c.env.JWT_SECRET);
-    if (payload.type !== "platform" || !payload.adminId) {
+    // Solo un token de PROPÓSITO "platform". Un access token de empresa (o un
+    // refresh) no entra al panel, aunque la firma sea válida: es la otra
+    // mitad de la separación de carriles que exige el claim `purpose`.
+    const payload = await verifyToken(token, c.env.JWT_SECRET, { expect: ["platform"] });
+    if (!payload.adminId) {
       return c.json({ ok: false, error: "Token de plataforma requerido" }, 403);
     }
     c.set("platformAdmin", { adminId: payload.adminId, email: payload.email || "" });
@@ -95,7 +98,7 @@ platform.post("/auth/login", async (c) => {
       passwordHash: await hashPassword(password),
     }).catch(() => null);
     await logPlatform(c.env, id, "platform.bootstrap", "platform_admin", id, { email }, ip);
-    const token = await signToken({ sub: id, adminId: id, email, type: "platform" } as any, c.env.JWT_SECRET, 12 * 3600);
+    const token = await signToken({ purpose: "platform", adminId: id, email }, c.env.JWT_SECRET, PLATFORM_TOKEN_TTL_SECONDS);
     return c.json({ ok: true, accessToken: token, admin: { id, email, name: "Admin de Plataforma" }, bootstrapped: true });
   }
 
@@ -106,7 +109,7 @@ platform.post("/auth/login", async (c) => {
   }
 
   await db.update(schema.platformAdmins).set({ lastLoginAt: new Date() }).where(eq(schema.platformAdmins.id, admin.id));
-  const token = await signToken({ sub: admin.id, adminId: admin.id, email: admin.email, type: "platform" } as any, c.env.JWT_SECRET, 12 * 3600);
+  const token = await signToken({ purpose: "platform", adminId: admin.id, email: admin.email }, c.env.JWT_SECRET, PLATFORM_TOKEN_TTL_SECONDS);
   await logPlatform(c.env, admin.id, "platform.login", "platform_admin", admin.id, null, ip);
   return c.json({ ok: true, accessToken: token, admin: { id: admin.id, email: admin.email, name: admin.name } });
 });
@@ -282,9 +285,13 @@ platform.post("/companies/:id/impersonate", async (c) => {
 
   // Token REAL de sesión de ese admin (misma forma que el login normal):
   // el panel lo guarda como sesión web y entra a la app como si fuera él.
+  // Propósito "support": es un access token de empresa (lo acepta el
+  // middleware normal) con vida corta y siempre auditado en
+  // platform_audit_logs, no un token normal que se confunda con el del
+  // dueño de la cuenta.
   const accessToken = await signToken(
-    { sub: admin.id, userId: admin.id, companyId: id, role: admin.role },
-    c.env.JWT_SECRET, 2 * 3600 // 2h — sesión de soporte, no de trabajo
+    { purpose: "support", userId: admin.id, companyId: id, role: admin.role },
+    c.env.JWT_SECRET, SUPPORT_TOKEN_TTL_SECONDS
   );
   return c.json({
     ok: true, accessToken,
