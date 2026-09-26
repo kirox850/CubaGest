@@ -62,10 +62,10 @@ export function ensureLocationStockStmt(
   return db
     .prepare(
       `INSERT INTO location_stock (id, location_id, product_id, qty, updated_at)
-       VALUES (?, ?, ?, 0, unixepoch())
+       VALUES (?, ?, ?, 0, ?
        ON CONFLICT(location_id, product_id) DO NOTHING`
     )
-    .bind(generateUUID(), locationId, productId);
+    .bind(generateUUID(), locationId, productId, Date.now());
 }
 
 /**
@@ -79,10 +79,10 @@ export function decrementStockStmt(
   return db
     .prepare(
       `UPDATE location_stock
-          SET qty = ROUND(qty - ?, 3), updated_at = unixepoch()
+          SET qty = ROUND(qty - ?, 3), updated_at = ?
         WHERE location_id = ? AND product_id = ? AND qty >= ?`
     )
-    .bind(qty, locationId, productId, qty);
+    .bind(qty, Date.now(), locationId, productId, qty);
 }
 
 /** Devuelve stock (anulación de venta, ajuste de cierre, entrada). */
@@ -92,10 +92,10 @@ export function incrementStockStmt(
   return db
     .prepare(
       `UPDATE location_stock
-          SET qty = ROUND(qty + ?, 3), updated_at = unixepoch()
+          SET qty = ROUND(qty + ?, 3), updated_at = ?
         WHERE location_id = ? AND product_id = ?`
     )
-    .bind(qty, locationId, productId);
+    .bind(qty, Date.now(), locationId, productId);
 }
 
 /** Fija el stock de una ubicación al valor contado en un cierre. */
@@ -105,10 +105,10 @@ export function setStockStmt(
   return db
     .prepare(
       `UPDATE location_stock
-          SET qty = ?, updated_at = unixepoch()
+          SET qty = ?, updated_at = ?
         WHERE location_id = ? AND product_id = ?`
     )
-    .bind(qty, locationId, productId);
+    .bind(qty, Date.now(), locationId, productId);
 }
 
 /** products.stock es SIEMPRE la suma de location_stock (columna calculada). */
@@ -117,10 +117,10 @@ export function recomputeProductStockStmt(db: D1DB, productId: string): D1Prepar
     .prepare(
       `UPDATE products
           SET stock = (SELECT COALESCE(SUM(qty), 0) FROM location_stock WHERE product_id = ?),
-              updated_at = unixepoch()
+              updated_at = ?
         WHERE id = ?`
     )
-    .bind(productId, productId);
+    .bind(productId, Date.now(), productId);
 }
 
 /** Movimiento de inventario con la ubicación donde ocurrió (columna 0007). */
@@ -139,11 +139,11 @@ export function stockMovementStmt(
   return db
     .prepare(
       `INSERT INTO stock_movements (id, company_id, product_id, user_id, location_id, type, qty, reason, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch())`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       generateUUID(), row.companyId, row.productId, row.userId, row.locationId,
-      row.type, row.qty, row.reason
+      row.type, row.qty, row.reason, Date.now()
     );
 }
 
@@ -190,10 +190,10 @@ export function auditStmt(
   return db
     .prepare(
       `INSERT INTO audit_logs (id, company_id, user_id, action, entity, entity_id, detail, ip, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch())`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       generateUUID(), row.companyId, row.userId, row.action, row.entity,
-      row.entityId ?? null, detail, row.ip ?? null
+      row.entityId ?? null, detail, row.ip ?? null, Date.now()
     );
 }

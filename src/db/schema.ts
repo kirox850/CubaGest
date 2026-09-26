@@ -422,6 +422,12 @@ export const companySettings = sqliteTable("company_settings", {
   manualRates: text("manual_rates", { mode: "json" }).notNull().$defaultFn(() => ({})),
   elToqueRates: text("eltoque_rates", { mode: "json" }).notNull().$defaultFn(() => ({})),
   elToqueUpdatedAt: integer("eltoque_updated_at", { mode: "timestamp" }),
+  // Margen de descuadre de dinero tolerado al cerrar caja. Es por empresa, no
+  // de la plataforma: cada dueño maneja esto a su manera.
+  cashToleranceMode: text("cash_tolerance_mode", { enum: ["absoluto", "porcentaje"] }).notNull().default("absoluto"),
+  cashToleranceValue: real("cash_tolerance_value").notNull().default(0),
+  // Las salidas de dinero de caja se aprueban siempre (admin o contador).
+  cashRequireApproval: integer("cash_require_approval", { mode: "boolean" }).notNull().default(true),
   updatedAt: integer("updated_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
 });
 

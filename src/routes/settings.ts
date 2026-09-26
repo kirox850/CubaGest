@@ -178,6 +178,11 @@ settings.get("/", async (c) => {
       manualRates: s.manualRates,
       rates: ratesInfo.rates,
       ratesUpdatedAt: ratesInfo.updatedAt,
+      // Margen de descuadre de dinero. Cualquier usuario autenticado lo lee
+      // porque el cierre de caja necesita saberlo en el móvil, sin conexión.
+      cashToleranceMode: s.cashToleranceMode,
+      cashToleranceValue: s.cashToleranceValue,
+      cashRequireApproval: !!s.cashRequireApproval,
     },
   });
 });
@@ -190,6 +195,9 @@ settings.put("/", requireRole("admin"), async (c) => {
     currencies?: string[];
     rateMode?: "manual" | "eltoque";
     manualRates?: Record<string, number>;
+    cashToleranceMode?: "absoluto" | "porcentaje";
+    cashToleranceValue?: number;
+    cashRequireApproval?: boolean;
   }>();
 
   await ensureCompanySettings(db, auth.companyId);
@@ -226,6 +234,29 @@ settings.put("/", requireRole("admin"), async (c) => {
       if (n > 0) mr[k] = n;
     }
     updates.manualRates = mr;
+  }
+
+  if (body.cashToleranceMode !== undefined) {
+    if (!["absoluto", "porcentaje"].includes(body.cashToleranceMode)) {
+      return c.json({ ok: false, error: "cashToleranceMode inválido" }, 400);
+    }
+    updates.cashToleranceMode = body.cashToleranceMode;
+  }
+
+  if (body.cashToleranceValue !== undefined) {
+    const v = Number(body.cashToleranceValue);
+    if (!isFinite(v) || v < 0) return c.json({ ok: false, error: "El margen no puede ser negativo" }, 400);
+    // Un porcentaje de más de 100 está tolero la mitad de la caja: casi
+    // seguro es un error de dedo, y perderse dinero es peor que avisar de más.
+    if (updates.cashToleranceMode === "porcentaje" || body.cashToleranceMode === "porcentaje") {
+      if (v > 100) return c.json({ ok: false, error: "El margen en % no puede pasar de 100" }, 400);
+    }
+    if (v > 1_000_000_000) return c.json({ ok: false, error: "El margen es demasiado grande" }, 400);
+    updates.cashToleranceValue = v;
+  }
+
+  if (body.cashRequireApproval !== undefined) {
+    updates.cashRequireApproval = body.cashRequireApproval ? true : false;
   }
 
   await db.update(schema.companySettings).set(updates)

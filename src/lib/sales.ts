@@ -314,8 +314,19 @@ export async function createSale(
   // 7) Cálculo TOTAL en el servidor. El cliente manda quantities, no precios:
   //    precio, descuentos, impuesto y total se calculan aquí, con los datos de
   //    la base de datos, y son los que se guardan.
+  // CUÁNDO se vendió, no cuándo llegó este servidor.
+  //
+  // Una venta hecha sin conexión puede tardar minutos u horas en sincronizarse
+  // (o días, si el cajero no tenía cobertura). Si la fechamos al llegar, cae
+  // fuera del período de un cierre que la verdadera ya incluye, y el cierre
+  // cuadra descuadrado. El móvil manda `offlineTimestamp` con el momento real.
   const now = new Date();
-  const saleDate = now.toISOString().split("T")[0];
+  const soldAt = typeof input.offlineTimestamp === "number" && Number.isFinite(input.offlineTimestamp)
+    ? new Date(input.offlineTimestamp)
+    : now;
+  // El día contable sigue a la venta, no a la sincronización: una venta del
+  // lunes sin conexión sigue siendo del lunes aunque llegue el martes.
+  const saleDate = soldAt.toISOString().split("T")[0];
   const lines: {
     product: typeof schema.products.$inferSelect;
     qty: number;
@@ -405,13 +416,17 @@ export async function createSale(
                           client_name, client_nit, client_phone, subtotal, tax, total,
                           currency, pay_method, discount_code, discount_total, discount_id,
                           client_sale_id, status, synced_at, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'emitida', ?, unixepoch())`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'emitida', ?, ?)`
     ).bind(
       saleId, auth.companyId, invoiceNumber, auth.userId, location.id, saleDate,
       input.clientName || "Consumidor Final", input.clientNit || "00000000000",
       input.clientPhone || null, subtotal, tax, total, saleCurrency, input.payMethod,
       saleDiscount?.code ?? null, totalDiscount, saleDiscount?.id ?? null,
-      clientId || null, input.synced ? unixepochNow() : null
+      clientId || null,
+      // synced_at = CUÁNDO LLEGÓ (diagnóstico). created_at = CUÁNDO SE VENDIÓ
+      // (contabilidad). Son cosas distintas y por eso son dos columnas.
+      input.synced ? now.getTime() : null,
+      soldAt.getTime()
     )
   );
 

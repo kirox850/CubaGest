@@ -265,8 +265,8 @@ export async function buildReturnAllStockStatements(
   const statements: D1PreparedStatement[] = [
     env.DB.prepare(
       `INSERT INTO stock_transfers (id, company_id, from_location_id, to_location_id, requested_by_id, resolved_by_id, status, notes, resolved_at, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'aprobado', ?, unixepoch(), unixepoch())`
-    ).bind(transferId, companyId, cajaLocationId, almacenLocationId, byUserId, byUserId, reason),
+       VALUES (?, ?, ?, ?, ?, ?, 'aprobado', ?, ?, ?)`
+    ).bind(transferId, companyId, cajaLocationId, almacenLocationId, byUserId, byUserId, reason, Date.now(), Date.now()),
   ];
 
   for (const row of withStock) {

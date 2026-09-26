@@ -336,7 +336,152 @@ console.log("\n9) Web Push: el cifrado de verdad (ida y vuelta)");
     I.cortarSiCabe("{\"a\":1}") === "{\"a\":1}");
 }
 
-console.log("\n10) El proxy del frontend reenvía la IP real");
+console.log("\n10) Modo sin conexión: lo que se rompió al probarlo en un teléfono");
+{
+  const locHook = readFileSync(new URL("../../CubaGest-Web/src/hooks/useLocations.ts", import.meta.url), "utf8");
+  const onlHook = readFileSync(new URL("../../CubaGest-Web/src/hooks/useOnline.ts", import.meta.url), "utf8");
+  const cierre  = readFileSync(new URL("../../CubaGest-Web/src/screens/CierreCaja.tsx", import.meta.url), "utf8");
+  const inv     = readFileSync(new URL("../../CubaGest-Web/src/screens/Inventario.tsx", import.meta.url), "utf8");
+  const app     = readFileSync(new URL("../../CubaGest-Web/src/App.tsx", import.meta.url), "utf8");
+  const offDB   = readFileSync(new URL("../../CubaGest-Web/src/offlineDB.ts", import.meta.url), "utf8");
+  const swOffline = readFileSync(new URL("../../CubaGest-Web/public/sw.js", import.meta.url), "utf8");
+
+  // ── El namespace de los datos locales ──
+  // La empresa vive en user.company.id. Si alguien "simplifica" a user.companyId,
+  // el namespace queda vacío y TODO el modo sin conexión deja de funcionar en
+  // silencio (sin error, solo una app que no carga nada).
+  check("el namespace usa user.company.id (no user.companyId)",
+    !locHook.includes("user?.companyId") && locHook.includes("user?.company?.id"));
+  check("y ninguna pantalla usa user.companyId para el namespace",
+    !/companyId:\s*user\?\.companyId/.test(
+      ["Inventario","POS","CierreCaja","Facturacion"].map(f =>
+        readFileSync(new URL(`../../CubaGest-Web/src/screens/${f}.tsx`, import.meta.url), "utf8")).join("\n")));
+
+  // ── La ubicación es lo que desbloquea todo lo demás ──
+  check("las ubicaciones se guardan para poder arrancar sin red",
+    /export async function cacheLocations/.test(offDB) && /export async function getOfflineLocations/.test(offDB));
+  check("y el inventario las usa en vez de pedirlas siempre por red",
+    /useLocations/.test(inv) && !/apiFetch\("\/locations"\)/.test(inv));
+  check("sin ubicación NO se sale en silencio (se explica el problema)",
+    /if \(!locationId\)/.test(inv) && /falta la ubicación/.test(inv));
+
+  // ── Lecturas de apertura ──
+  check("las lecturas se cachean para poder cerrar sin red",
+    /export async function cacheReadings/.test(offDB) && /export async function getOfflineReadings/.test(offDB));
+  check("el cierre ya NO depende de un fetch que sin red no existe",
+    !/apiFetch\("\/closing\/readings"\)/.test(cierre));
+
+  // ── El conteo sin conexión ──
+  check("sin conexión se cuenta contra la lectura, no contra el servidor",
+    /previewSinConexion/.test(cierre) && /stockInitial: it\.qty/.test(cierre));
+  check("y los faltantes NO se inventan en local (quedan pendientes)",
+    /stockExpected: null/.test(cierre) && /stockSold: null/.test(cierre) && /faltante se calcula al enviarse/.test(cierre));
+  check("el conteo sin red se guarda en una cola, no se pierde",
+    /saveClosingOffline/.test(cierre) && /Guardar conteo en el móvil/.test(cierre));
+  check("la cola se envía sola al volver la conexión",
+    /syncClosingsOffline/.test(app) && /getPendingClosings/.test(app));
+  check("reenviar un cierre ya registrado no lo duplica (409 = hecho)",
+    /e\?\.status === 409/.test(app) && /yaHecho \? 'synced' : 'pending'/.test(app));
+  check("los cierres pendientes se ven en la lista (nadie cree que se perdió)",
+    /pendientes\.length > 0/.test(cierre) && /Conteo guardado sin conexión/.test(cierre));
+
+  // ── La red que miente ──
+  check("la app no se fía solo de navigator.onLine (miente con WiFi sin salida)",
+    /onNetworkChange/.test(onlHook) && /delNavegador && netReal/.test(onlHook));
+  check("una respuesta recibida demuestra que hay red",
+    /_marcarHayRed\(\)/.test(readFileSync(new URL("../../CubaGest-Web/src/lib/api.ts", import.meta.url), "utf8")));
+  check("y un fallo de transporte la desmiente (sin esperar a los 8 s)",
+    /_marcarSinRed\(\)/.test(readFileSync(new URL("../../CubaGest-Web/src/lib/api.ts", import.meta.url), "utf8")));
+  check("sin conexión el banner dice qué sigue funcionando",
+    /puedes vender, ver el inventario y hacer el conteo de cierre/.test(
+      readFileSync(new URL("../../CubaGest-Web/src/components/shared/primitives.tsx", import.meta.url), "utf8")));
+
+  // ── La web app shell sí arranca sin red ──
+  check("el service worker sirve la app sin conexión",
+    /caches\.match\('\/index\.html'\)/.test(swOffline) && /req\.mode === 'navigate'/.test(swOffline));
+  check("pero nunca cachea datos de /api (se filtrarían entre usuarios)",
+    /if \(isApiPath\(url\.pathname\)\) return;/.test(swOffline));
+  check("la versión del caché sube para que el móvil tome la app nueva",
+    /const CACHE = 'cubagest-v8'/.test(swOffline));
+}
+
+console.log("\n11) Fechas de venta: la hora real, no la de llegada");
+{
+  const salesSrc = readFileSync(new URL("../src/lib/sales.ts", import.meta.url), "utf8");
+  const batchSrc = readFileSync(new URL("../src/lib/batch.ts", import.meta.url), "utf8");
+  const appSrc  = readFileSync(new URL("../../CubaGest-Web/src/App.tsx", import.meta.url), "utf8");
+
+  // ── La trampa: unixepoch() da SEGUNDOS y drizzle mode:"timestamp" espera
+  //    MILISEGUNDOS. Con eso toda venta se leía como 1970 y NINGUNA entraba a
+  //    un cierre (el filtro por período comparaba 1970 contra la fecha real).
+  check("ningún insert de stock/auditoría vuelve a usar unixepoch()",
+    !/unixepoch\(\)/.test(batchSrc), "quedan: " + (batchSrc.match(/unixepoch\(\)/g) || []).length);
+  check("las transferencias tampoco", !/unixepoch\(\)/.test(
+    readFileSync(new URL("../src/lib/locations.ts", import.meta.url), "utf8")));
+  check("la venta guarda created_at en milisegundos",
+    /created_at\)\n\s*VALUES \(.*\?\)/.test(salesSrc) && /soldAt\.getTime\(\)/.test(salesSrc));
+  check("y usa el momento en que se VENDIÓ, no el de llegada",
+    /new Date\(input\.offlineTimestamp\)/.test(salesSrc) && /soldAt = typeof input\.offlineTimestamp/.test(salesSrc));
+  check("el día contable sigue a la venta, no a la sincronización",
+    /saleDate = soldAt\.toISOString\(\)/.test(salesSrc));
+  check("synced_at guarda aparte cuándo llegó (diagnóstico, no contabilidad)",
+    /input\.synced \? now\.getTime\(\) : null/.test(salesSrc));
+
+  // La reparación de lo ya guardado.
+  const mig = readFileSync(new URL("../migrations/0010_sale_dates_ms.sql", import.meta.url), "utf8");
+  check("hay migración que arregla las ventas ya fechadas en 1970",
+    /UPDATE sales\s+SET created_at = created_at \* 1000/.test(mig));
+  check("y solo toca valores que son segundos (no toca lo ya correcto)",
+    /created_at < 100000000000/.test(mig));
+
+  // ── Orden de la sincronización ──
+  const ventas = appSrc.indexOf("/sales/sync");
+  const cierres = appSrc.indexOf("await syncClosingsOffline(acc);", ventas);
+  check("las ventas se sincronizan ANTES que los cierres",
+    ventas > -1 && cierres > ventas, "ventas en " + ventas + ", cierre en " + cierres);
+  check("y el motivo está escrito, porque el orden no es obvious",
+    /cierre se calcula con las[\s\S]*?ventas que el servidor tenga/.test(appSrc));
+}
+
+console.log("\n12) Configuración: todo en un sitio, y el margen es del negocio");
+{
+  const app  = readFileSync(new URL("../../CubaGest-Web/src/App.tsx", import.meta.url), "utf8");
+  const conf = readFileSync(new URL("../../CubaGest-Web/src/screens/Configuracion.tsx", import.meta.url), "utf8");
+  const caja = readFileSync(new URL("../../CubaGest-Web/src/screens/CajaSettings.tsx", import.meta.url), "utf8");
+  const set  = readFileSync(new URL("../src/routes/settings.ts", import.meta.url), "utf8");
+  const sch  = readFileSync(new URL("../src/db/schema.ts", import.meta.url), "utf8");
+
+  check("el menú de perfil tiene UNA entrada de configuración, no cuatro",
+    /Configuración/.test(app) && !/setCurrenciesOpen\(true\)/.test(app) && !/setDiscountsOpen\(true\)/.test(app));
+  check("y las cuatro pantallas viven dentro, como pestañas laterales",
+    /type TabId = "caja" \| "monedas" \| "descuentos" \| "usuarios" \| "auditoria" \| "plan"/.test(conf));
+  check("el paso a lateral se hace por CSS, no con estilos inline",
+    /\.cfg-split \{ flex-direction:row; \}/.test(conf) && !/className="cfg-split" style=/.test(conf));
+  check("nada de modales anidados (el de arriba tapaba al de abajo, sin vuelta atrás)",
+    /embedded \? contenido : <Modal/.test(readFileSync(new URL("../../CubaGest-Web/src/screens/PlanModal.tsx", import.meta.url), "utf8"))
+    && /embedded \? contenido : <Modal/.test(readFileSync(new URL("../../CubaGest-Web/src/screens/CurrenciesSettings.tsx", import.meta.url), "utf8"))
+    && /embedded \? contenido : <Modal/.test(readFileSync(new URL("../../CubaGest-Web/src/screens/DiscountsAdmin.tsx", import.meta.url), "utf8")));
+
+  // El margen: decisión de cada negocio, NO de la plataforma.
+  check("el margen de dinero vive en la empresa, no en el código",
+    /cashToleranceMode: text\("cash_tolerance_mode"/.test(sch) && /cash_tolerance_mode/.test(
+      readFileSync(new URL("../migrations/0011_cash_tolerance.sql", import.meta.url), "utf8")));
+  check("se puede expresar en cantidad fija o en porcentaje",
+    /cashToleranceMode === "porcentaje"/.test(set) && /modo === "porcentaje"/.test(caja));
+  check("por defecto NO tolera nada (perdonar sin que el dueño lo pida es esconderle dinero)",
+    /cash_tolerance_value REAL NOT NULL DEFAULT 0/.test(
+      readFileSync(new URL("../migrations/0011_cash_tolerance.sql", import.meta.url), "utf8")));
+  check("y se valida: ni negativo, ni un % de más de 100",
+    /El margen no puede ser negativo/.test(set) && /no puede pasar de 100/.test(set));
+  check("solo el admin lo cambia (la ruta PUT ya es requireRole admin)",
+    /requireRole\("admin"\), async \(c\)/.test(set));
+  check("el móvil lo puede leer aunque no tenga conexión (lo necesita el cierre)",
+    /cashToleranceMode: s\.cashToleranceMode/.test(set));
+  check("las salidas de dinero siempre se aprueban",
+    /cashRequireApproval/.test(sch) && /aprobación de un admin o un contador/.test(caja));
+}
+
+console.log("\n13) El proxy del frontend reenvía la IP real");
 const proxySrc = readFileSync(new URL("../../CubaGest-Web/functions/api/[[path]].ts", import.meta.url), "utf8");
 check("functions/api/[[path]].ts reenvía cf-connecting-ip", /headers\.set\("cf-connecting-ip"/.test(proxySrc));
 check("el proxy corta si el backend se cuelga (AbortController)",
