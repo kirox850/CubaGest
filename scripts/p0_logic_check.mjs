@@ -180,6 +180,7 @@ console.log("\n8) Los tres avisos que tienen que dispararse");
   const trSrc = readFileSync(new URL("../src/routes/transfers.ts", import.meta.url), "utf8");
   const clSrc = readFileSync(new URL("../src/routes/closing.ts", import.meta.url), "utf8");
   const pushLib = readFileSync(new URL("../src/lib/push.ts", import.meta.url), "utf8");
+  const webpushSrc = readFileSync(new URL("../src/lib/webpush.ts", import.meta.url), "utf8");
   const swSrc = readFileSync(new URL("../../CubaGest-Web/public/sw.js", import.meta.url), "utf8");
   const bellSrc = readFileSync(new URL("../../CubaGest-Web/src/components/shared/NotificationsBell.tsx", import.meta.url), "utf8");
 
@@ -191,16 +192,151 @@ console.log("\n8) Los tres avisos que tienen que dispararse");
   check("el aviso de faltante solo sale si hubo faltante", /if \(hasShortage\)/.test(clSrc));
   check("el aviso se manda sin bloquear la respuesta (waitUntil)", /waitUntil/.test(trSrc) && /waitUntil/.test(clSrc));
   check("el aviso se guarda en la base ANTES de empujarlo", pushLib.indexOf("db.insert(schema.notifications)") < pushLib.indexOf("pushToBrowsers(env"));
+  // Sin comentarios: si no, el test se dispara con los textos que explican
+  // por qué web-push no se usa (que mencionan web-push y require("https")).
+  const soloCodigo = (src) => src.split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+  check("ya NO se usa la librería 'web-push' de Node (no existe en un Worker)",
+    !/from "web-push"|require\("web-push"\)|import\("web-push"\)/.test(soloCodigo(pushLib))
+    && !/require\('(https|crypto|net|url|util|stream|tls|assert|buffer)'\)/.test(soloCodigo(webpushSrc)));
+  check("el cifrado usa solo la Web Crypto del runtime (sin dependencias)",
+    /crypto\.subtle/.test(webpushSrc) && !/^import .* from "node:/m.test(webpushSrc));
   check("un aviso nunca rompe la venta que lo disparó", /console\.error\(`push: no se pudo registrar/.test(pushLib));
-  check("un navegador muerto (404/410) se borra de la lista", /status === 404 \|\| status === 410/.test(pushLib));
-  check("un fallo del servicio NO borra la suscripción (se reintenta)", /status === 404/.test(pushLib) && /failures: sub\.failures \+ 1/.test(pushLib));
+  check("un navegador muerto (404/410) se borra de la lista",
+    /r\.gone/.test(pushLib) && /db\.delete\(schema\.pushSubscriptions\)/.test(pushLib));
+  check("sendPush marca 404/410 como 'gone' (y no como error de red)",
+    /gone: res\.status === 404 \|\| res\.status === 410/.test(webpushSrc));
+  check("un fallo del servicio NO borra la suscripción (se reintenta)",
+    /r\.status >= 400/.test(pushLib) && /failures: sub\.failures \+ 1/.test(pushLib));
+  check("un payload enorme se recorta antes de cifrar (límite de 4 KB)",
+    /cortarSiCabe\(payload\)/.test(webpushSrc) && /MAX_BODY = 4096/.test(webpushSrc));
   check("el service worker muestra el aviso", /addEventListener\('push'/.test(swSrc) && /showNotification/.test(swSrc));
   check("al tocar el aviso se abre la pantalla indicada", /addEventListener\('notificationclick'/.test(swSrc));
   check("la lista sale de la base, no del push (si el push falla, se ve igual)", /apiFetch\("\/push\/notifications/.test(bellSrc));
   check("el permiso NO se pide al arrancar (se pregunta en la campanita)", !/requestPermission/.test(bellSrc));
 }
 
-console.log("\n9) El proxy del frontend reenvía la IP real");
+console.log("\n9) Web Push: el cifrado de verdad (ida y vuelta)");
+{
+  const wp = await import("../src/lib/webpush.ts");
+  const { _internals: I } = wp;
+  const b64u = I.bytesToB64u;
+  const fromB64u = I.b64uToBytes;
+  const cat = I.concat;
+  const enc = new TextEncoder();
+
+  // Se simula un suscriptor: tiene su par de llaves, y SOLO debe poder
+  // descifrar lo que este archivo cifró con las suyas.
+  const receiver = crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+  const receiverPub = new Uint8Array(await crypto.subtle.exportKey("raw", (await receiver).publicKey));
+  const receiverJwk = await crypto.subtle.exportKey("jwk", (await receiver).privateKey);
+  const authSecret = crypto.getRandomValues(new Uint8Array(16));
+
+  const sub = {
+    endpoint: "https://fcm.googleapis.com/fcm/send/abc123",
+    p256dh: b64u(receiverPub),
+    auth: b64u(authSecret),
+  };
+  const texto = JSON.stringify({ title: "Tienes un envío por aprobar", body: "3 × Aceite" });
+
+  const body = await I.encrypt(texto, sub);
+  check("el cuerpo cifrado no contiene el texto en claro",
+    !new TextDecoder().decode(body).includes("aprobado"));
+  check("el cuerpo tiene la forma salt(65) + nonce(12) + cifrado + tag(16)",
+    body.length === 65 + 12 + enc.encode(texto).length + 1 + 16, `largo=${body.length}`);
+
+  // ── Descifrado INDEPENDIENTE (la parte que de verdad prueba la matemática) ──
+  const salt = body.subarray(0, 65);
+  const nonce = body.subarray(65, 77);
+  const sealed = body.subarray(77);
+  const uaPublic = fromB64u(sub.p256dh);
+
+  // OJO: el receptor hace ECDH( SU privada , el SALT ). El salt es la pública
+  // efímera del emisor, que viaja en el propio mensaje. Usar su propia pública
+  // (que es p256dh) daría otro valor y el descifrado fallaría.
+  const shared = new Uint8Array(await crypto.subtle.deriveBits(
+    { name: "ECDH", public: await crypto.subtle.importKey("raw", salt, { name: "ECDH", namedCurve: "P-256" }, false, []) },
+    (await receiver).privateKey, 256));
+  const prk = await I.hmac(fromB64u(sub.auth), shared);
+  const ikm = await I.hmac(prk, cat(I.UTF8.encode("WebPush: info\0"), uaPublic, salt));
+  const cek = await I.hmac(ikm, I.UTF8.encode("Content-Encoding: aes128gcm\0"), 16);
+  const nonceFull = await I.hmac(cek, I.UTF8.encode("Content-Encoding: nonce\0"));
+  const recordNonce = nonceFull.slice(nonceFull.length - 12);
+
+  check("el nonce calculado por el receptor es el mismo que va en el cuerpo",
+    b64u(recordNonce) === b64u(nonce));
+
+  const plain = new Uint8Array(await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: recordNonce, additionalData: salt, tagLength: 128 },
+    await crypto.subtle.importKey("raw", cek, "AES-GCM", false, ["decrypt"]),
+    sealed));
+  check("el receptor recupera EXACTAMENTE el texto enviado",
+    new TextDecoder().decode(plain.subarray(0, plain.length - 1)) === texto);
+  check("el delimitador de fin de registro es 0x02", plain[plain.length - 1] === 0x02);
+
+  // Alguien que ve el mensaje por el camino no puede descifrarlo aunque tenga
+  // la pública del receptor (que es pública, va en la suscripción): sin el
+  // `auth_secret` —que es privado del navegador— no puede derivar la misma llave.
+  const intrusoShared = new Uint8Array(await crypto.subtle.deriveBits(
+    { name: "ECDH", public: await crypto.subtle.importKey("raw", salt, { name: "ECDH", namedCurve: "P-256" }, false, []) },
+    (await receiver).privateKey, 256));
+  const intrusoAuth = crypto.getRandomValues(new Uint8Array(16)); // no es el del receptor
+  const intrusoIkm = await I.hmac(await I.hmac(intrusoAuth, intrusoShared), cat(I.UTF8.encode("WebPush: info\0"), uaPublic, salt));
+  const intrusoCek = await I.hmac(intrusoIkm, I.UTF8.encode("Content-Encoding: aes128gcm\0"), 16);
+  const intrusoNonce = (await I.hmac(intrusoCek, I.UTF8.encode("Content-Encoding: nonce\0"))).slice(20);
+  let fallo = "NO FALLÓ (¡el cifrado no sirve!)";
+  try {
+    await crypto.subtle.decrypt({ name: "AES-GCM", iv: intrusoNonce, additionalData: salt, tagLength: 128 },
+      await crypto.subtle.importKey("raw", intrusoCek, "AES-GCM", false, ["decrypt"]), sealed);
+  } catch { fallo = null; }
+  check("alguien con otra llave NO puede descifrar el aviso", fallo === null, fallo ?? "");
+
+  // Y un mensaje con un solo bit cambiado tampoco se puede leer (AES-GCM
+  // autentica: por eso el salt va como datos adicionales).
+  const cifradoAlterado = cat(salt, nonce, (() => { const t = sealed.slice(); t[0] ^= 1; return t; })());
+  let fallo2 = "NO FALLÓ";
+  try {
+    await crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce, additionalData: salt, tagLength: 128 },
+      await crypto.subtle.importKey("raw", cek, "AES-GCM", false, ["decrypt"]), cifradoAlterado);
+  } catch { fallo2 = null; }
+  check("un mensaje alterado NO se puede descifrar", fallo2 === null, fallo2 ?? "");
+
+  // ── La llave VAPID (es el "quién envía") ──
+  const vapidPair = crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+  const vpJwk = await crypto.subtle.exportKey("jwk", (await vapidPair).privateKey);
+  const punto = cat(new Uint8Array([0x04]), fromB64u(vpJwk.x), fromB64u(vpJwk.y));
+  const authHeader = await I.vapidAuthorization(sub.endpoint, b64u(punto), vpJwk.d, "mailto:prueba@ejemplo.com");
+  check("la cabecera VAPID tiene el formato correcto", /^vapid t=[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+, k=[A-Za-z0-9_-]+$/.test(authHeader));
+  const jwt = authHeader.match(/t=([^,]+)/)[1];
+  const [h, p, sig] = jwt.split(".");
+  const verif = await crypto.subtle.verify(
+    { name: "ECDSA", hash: "SHA-256" },
+    await crypto.subtle.importKey("jwk", { kty: "EC", crv: "P-256", x: vpJwk.x, y: vpJwk.y }, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]),
+    fromB64u(sig), I.UTF8.encode(`${h}.${p}`));
+  check("la firma VAPID se verifica con la llave pública (ES256)", verif === true);
+  const payload = JSON.parse(new TextDecoder().decode(fromB64u(p)));
+  check("el JWT de VAPID apunta al origen del endpoint", payload.aud === "https://fcm.googleapis.com", payload.aud);
+  check("y caduca en 12 horas o menos", payload.exp - Math.floor(Date.now() / 1000) <= 12 * 3600 && payload.exp > Math.floor(Date.now() / 1000));
+  const firmaAlterada = `${h}.${p}.${b64u(crypto.getRandomValues(new Uint8Array(64)))}`;
+  const mal = await crypto.subtle.verify(
+    { name: "ECDSA", hash: "SHA-256" },
+    await crypto.subtle.importKey("jwk", { kty: "EC", crv: "P-256", x: vpJwk.x, y: vpJwk.y }, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]),
+    fromB64u(firmaAlterada.split(".")[2]), I.UTF8.encode(`${h}.${p}`));
+  check("una firma alterada NO verifica", mal === false);
+
+  // Un payload enorme se recorta ANTES de cifrar, y el JSON sigue siendo válido
+  // (partirlo a lo bruto daría algo que el service worker no puede leer).
+  const enorme = JSON.stringify({ id: "x", title: "T".repeat(5000), body: "B".repeat(5000), link: "/" });
+  const recortado = I.cortarSiCabe(enorme);
+  const cuerpoEnorme = await I.encrypt(recortado, sub);
+  check("un payload enorme produce un cuerpo dentro del límite de 4096",
+    cuerpoEnorme.length <= 4096, `largo=${cuerpoEnorme.length}`);
+  check("el recorte sigue siendo JSON válido",
+    (() => { try { JSON.parse(recortado); return true; } catch { return false; } })());
+  check("un payload normal NO se toca",
+    I.cortarSiCabe("{\"a\":1}") === "{\"a\":1}");
+}
+
+console.log("\n10) El proxy del frontend reenvía la IP real");
 const proxySrc = readFileSync(new URL("../../CubaGest-Web/functions/api/[[path]].ts", import.meta.url), "utf8");
 check("functions/api/[[path]].ts reenvía cf-connecting-ip", /headers\.set\("cf-connecting-ip"/.test(proxySrc));
 check("el proxy corta si el backend se cuelga (AbortController)",

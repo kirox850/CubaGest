@@ -10,6 +10,13 @@ database_id = "067cfeb9-8fd8-4dd1-a201-5f874db9977a"
 
 [vars]
 ENVIRONMENT = "production"
+# La llave PÚBLICA de los avisos. Va aquí a propósito y no solo en el panel de
+# Cloudflare: `wrangler deploy` SOBRESCRIBE las variables del panel con las de
+# este archivo, así que lo que se ponga solo en el panel desaparece en el
+# siguiente deploy (por eso el deploy avisa del cambio).
+# No es un secreto: es pública y va dentro del bundle de la web, que la usa para
+# suscribir el navegador. La privada NO va aquí: esa va en el panel, en Secrets.
+VAPID_PUBLIC_KEY = "BC1ahvyWmN9-fctxhdWf1FLgLSHaEU3B-vfi-2qscXD1PYgZQBEc402MMbkmMTk_ZFna1uSVRJk3_Lk5x6OLZI0"
 
 [triggers]
 # Corre todos los días a las 06:00 UTC (02:00 en Cuba) y cobra las

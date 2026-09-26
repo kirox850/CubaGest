@@ -20,43 +20,27 @@
 // simplemente no manda push, pero el resto sigue funcionando.
 import { and, eq } from "drizzle-orm";
 import * as schema from "../db/schema";
+import { sendPush } from "./webpush";
 
-type WebPushModule = {
-  setVapidDetails: (subject: string, publicKey: string, privateKey: string) => void;
-  sendNotification: (sub: unknown, payload?: string | null, options?: unknown) => Promise<unknown>;
-};
+// El aviso se manda con la Web Crypto API del propio runtime (ver lib/webpush.ts).
+// Antes se usaba la librería `web-push` de Node, que no funciona en un Worker:
+// hace require('https') y require('crypto'), que aquí no existen.
+let avisadoDeFaltanLlaves = false;
 
-let webPushPromise: Promise<WebPushModule> | null = null;
-let vapidReady = false;
-
-async function getWebPush(env: Env): Promise<WebPushModule | null> {
-  const subject = env.VAPID_SUBJECT || "mailto:kirox850@gmail.com";
+function vapidDe(env: Env): { publicKey: string; privateKey: string; subject: string } | null {
   if (!env.VAPID_PUBLIC_KEY || !env.VAPID_PRIVATE_KEY) {
     // Una vez por ejecución, no una por aviso.
-    if (!vapidReady) {
-      console.error("push: faltan VAPID_PUBLIC_KEY/VAPID_PRIVATE_KEY — no se mandarán avisos");
-      vapidReady = true;
+    if (!avisadoDeFaltanLlaves) {
+      console.error("push: faltan VAPID_PUBLIC_KEY/VAPID_PRIVATE_KEY — no se mandarán avisos (el aviso igual queda guardado en la app)");
+      avisadoDeFaltanLlaves = true;
     }
     return null;
   }
-  try {
-    if (!webPushPromise) {
-      // Se copian a constantes: la comprobación de "faltan" está más arriba y
-      // TypeScript la pierde dentro del closure, aunque en runtime siga siendo
-      // cierta. Copiar además evita que un cambio a mitad de vuelo los cambie.
-      const publicKey = env.VAPID_PUBLIC_KEY;
-      const privateKey = env.VAPID_PRIVATE_KEY;
-      webPushPromise = import("web-push").then((m) => {
-        const wp = ((m as any).default ?? m) as WebPushModule;
-        wp.setVapidDetails(subject, publicKey, privateKey);
-        return wp;
-      });
-    }
-    return await webPushPromise;
-  } catch {
-    console.error("push: falta la librería 'web-push' (npm i web-push) — no se mandarán avisos");
-    return null;
-  }
+  return {
+    publicKey: env.VAPID_PUBLIC_KEY,
+    privateKey: env.VAPID_PRIVATE_KEY,
+    subject: env.VAPID_SUBJECT || "mailto:kirox850@gmail.com",
+  };
 }
 
 type NotifyInput = {
@@ -107,8 +91,8 @@ async function pushToBrowsers(
   db: NotifyInput["db"],
   msg: { id: string; companyId: string; userIds?: string[]; title: string; body: string; link?: string; data?: Record<string, unknown> }
 ) {
-  const wp = await getWebPush(env);
-  if (!wp) return;
+  const vapid = vapidDe(env);
+  if (!vapid) return;
 
   const subs = await db.select().from(schema.pushSubscriptions).where(eq(schema.pushSubscriptions.companyId, msg.companyId)).all();
   if (subs.length === 0) return;
@@ -128,28 +112,36 @@ async function pushToBrowsers(
   await Promise.all(
     targets.map(async (sub) => {
       try {
-        await wp.sendNotification(
-          { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
+        const r = await sendPush(
+          { endpoint: sub.endpoint, p256dh: sub.p256dh, auth: sub.auth },
           payload,
-          { TTL: 60 * 60 * 12, urgency: "high" },
+          { ...vapid, ttlSeconds: 60 * 60 * 12 },
         );
-        await db.update(schema.pushSubscriptions)
-          .set({ lastOkAt: new Date(), failures: 0 })
-          .where(eq(schema.pushSubscriptions.id, sub.id));
-      } catch (err: any) {
-        const status = err?.statusCode;
-        // 404/410 = ese navegador ya no existe (se desinstaló, se borró el
-        // permiso). No tiene sentido reintentar jamás: se borra la fila.
-        if (status === 404 || status === 410) {
+        if (r.gone) {
+          // 404/410 = ese navegador ya no existe (se desinstaló, se borró el
+          // permiso). Reintentar sería inútil para siempre: se borra la fila.
           await db.delete(schema.pushSubscriptions).where(eq(schema.pushSubscriptions.id, sub.id));
           return;
         }
-        // Cualquier otro fallo (servicio caído, sin red) es del servicio, no
-        // del navegador: se anota y se deja la suscripción viva para reintentar.
+        if (r.status >= 400) {
+          // 429 = el servicio está saturado; cualquier otro 4xx/5xx es problema
+          // del servicio, no del navegador. En ambos casos se anota y se deja
+          // la suscripción viva para reintentar.
+          await db.update(schema.pushSubscriptions)
+            .set({ failures: sub.failures + 1 })
+            .where(eq(schema.pushSubscriptions.id, sub.id));
+          console.error(`push: el servicio respondió ${r.status}, se reintentará`);
+          return;
+        }
+        await db.update(schema.pushSubscriptions)
+          .set({ lastOkAt: new Date(), failures: 0 })
+          .where(eq(schema.pushSubscriptions.id, sub.id));
+      } catch (err) {
+        // Fallo de red o de cifrado: tampoco es culpa del navegador.
         await db.update(schema.pushSubscriptions)
           .set({ failures: sub.failures + 1 })
           .where(eq(schema.pushSubscriptions.id, sub.id));
-        console.error(`push: fallo al avisar (${status ?? "sin código"}), se reintentará:`, errorMessage(err));
+        console.error(`push: fallo al avisar, se reintentará:`, errorMessage(err));
       }
     })
   );
