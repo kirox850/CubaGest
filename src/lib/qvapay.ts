@@ -69,14 +69,21 @@ export async function qvapayCharge(
 }
 
 // Verifica (sin bloquear) que el callback de authorize_payments venga
-// firmado como esperamos. La documentación oficial de QvaPay NO detalla el
-// formato del callback (data/token) ni cómo validarlo — lo que sabemos es
-// solo lo observado en producción (data en Base64, token de 64 hex, que
-// tiene pinta de HMAC-SHA256). Como no está confirmado por soporte/doc,
-// esta función NO debe usarse para rechazar el callback todavía: solo para
-// loguear si coincide, y así juntar evidencia antes de convertirlo en un
-// bloqueo real. Si en varias pruebas reales el hash siempre coincide,
-// entonces sí conviene endurecerlo a rechazo.
+// firmado como esperamos.
+//
+// HECHOS (logs reales de producción, 2026-09-26): el token que llega SÍ es
+// HMAC-SHA256(app_secret, data) — "hash calculado coincide con token
+// recibido: true" en un callback auténtico, y el data resultante es un JSON
+// Base64 con {remote_id, user_uuid, user_email, user_name, verified,
+// auth_secret}. O sea que nuestra suposición era correcta.
+//
+// Aun así NO se usa para rechazar: la doc oficial de QvaPay sigue sin
+// documentar el formato del callback ni el algoritmo, así que si QvaPay lo
+// cambiara alguna vez, un rechazo bloquearía TODAS las suscripciones nuevas.
+// La garantía real de que un callback es legítimo no es esta firma, sino la
+// tabla payment_authorizations (0008): el remote_id del callback tiene que
+// coincidir con un state de un solo uso que el propio admin generó hace unos
+// minutos desde la app. La firma queda como alerta.
 export async function qvapayComputeHmac(appSecret: string, data: string): Promise<string> {
   const enc = new TextEncoder();
   const key = await crypto.subtle.importKey(
@@ -92,12 +99,41 @@ export async function qvapayComputeHmac(appSecret: string, data: string): Promis
     .join("");
 }
 
+// ── Clasificación de un fallo de cobro ──────────────────────────────────────
+// No es lo mismo "el pago fue rechazado" que "no conseguimos intentarlo".
+// Confundirlas baja de plan a un cliente que en realidad no debe nada, así que
+// la decisión vive aquí, aislada y probada, y no dentro del bucle del cron.
+//
+//   retry_later → NO secobró nada por nuestra causa: límite de peticiones de
+//                  QvaPay (429) o su servidor caído (5xx) o sin red. El
+//                  cliente no se toca; se reintenta en la próxima corrida.
+//   rejected    → QvaPay respondió que ese cobro no es posible: el usuario no
+//                  autorizó, no existe, o no tiene saldo. Es un fallo real y el
+//                  cliente sí debe enterarse.
+export type ChargeOutcome = "retry_later" | "rejected";
+
+export function classifyChargeFailure(err: unknown): ChargeOutcome {
+  const status = typeof (err as any)?.status === "number" ? (err as any).status : null;
+  if (status === 429) return "retry_later";                 // rate limit documentado
+  if (status !== null && status >= 500) return "retry_later"; // problema de QvaPay
+  if (status === null) return "retry_later";                // sin status = error de red
+  return "rejected";                                        // 4xx: respuesta definitiva
+}
+
 // Decodifica el payload `data` (Base64 -> JSON) que manda QvaPay en el
 // callback de authorize_payments. Confirmado con una autorización real:
 // contiene remote_id, user_uuid, user_email, user_name, verified y
 // auth_secret. auth_secret NO es necesario para /v2/charge según la doc
 // oficial (que solo pide user_uuid) — lo guardamos igual por si acaso, pero
 // no se usa en el cobro.
+//
+// `verified`: el payload real llega con "verified": true, pero NI la doc ni
+// soporte explican qué significa. Decisión del dueño del producto: NO se usa
+// como regla para rechazar suscripciones — si QvaPay lo cambiara o mandara
+// false de pronto, bloquearíamos pagos legítimos sin saber por qué. Solo se
+// registra en el log para seguir acumulando evidencia. Si algún día se
+// confirma que es el KYC de QvaPay, lo correcto es avisarle al admin en el
+// panel ("tu cuenta de QvaPay no está verificada"), no rechazar el callback.
 export interface QvaPayCallbackData {
   remote_id?: string;
   user_uuid?: string;

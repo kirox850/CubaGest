@@ -29,6 +29,7 @@ db.exec("PRAGMA foreign_keys = ON;");
 
 const allFiles = readdirSync(migrationsDir).filter((f) => f.endsWith(".sql")).sort();
 const p0File = "0007_p0_integrity.sql";
+const p0bFile = "0008_payment_authorizations.sql";
 
 function applyMigrations(files) {
   for (const file of files) {
@@ -64,7 +65,7 @@ function throws(name, fn, expectMsg) {
   }
 }
 
-applyMigrations(allFiles.filter((f) => f !== p0File));
+applyMigrations(allFiles.filter((f) => f !== p0File && f !== p0bFile));
 
 const now = Math.floor(Date.now() / 1000);
 const one = (sql, ...p) => db.prepare(sql).get(...p);
@@ -82,8 +83,8 @@ check("antes de 0007 la empresa NO tiene almacén",
 check("antes de 0007 la empresa NO tiene company_settings",
   !one(`SELECT company_id FROM company_settings WHERE company_id='c1'`));
 
-console.log("\n0) Se aplica 0007 sobre el estado heredado");
-applyMigrations([p0File]);
+console.log("\n0) Se aplican 0007 y 0008 sobre el estado heredado");
+applyMigrations([p0File, p0bFile]);
 
 // ── 1) Backfill de empresa que existía antes de la migration ───────────────
 console.log("\n1) Backfill de empresa creada antes de la migration");
@@ -274,6 +275,30 @@ check("el cierre histórico sin confirm_key no bloquea a los nuevos", (() => {
 })());
 
 // ── 10) Envío resuelto una sola vez ────────────────────────────────────────
+console.log("\n11) Autorizaciones de pago de un solo uso (0008)");
+{
+  run(`INSERT INTO payment_authorizations (state, company_id, plan, user_id, status, created_at, expires_at)
+       VALUES (?,?,?,?,?,?,?)`, "st_abc123", "c1", "pro", "u1", "pending", now, now + 600);
+  check("la fila se guarda con su plan", one(`SELECT plan FROM payment_authorizations WHERE state='st_abc123'`).plan === "pro");
+  const st = db.prepare(`SELECT state, company_id FROM payment_authorizations WHERE status='pending' AND expires_at > ?`).all(now);
+  check("se puede localizar por state (de donde sale la empresa, no de la URL)", st.length === 1 && st[0].company_id === "c1");
+  // Un state es de un solo uso: el claim condicional solo tiene éxito la primera vez.
+  const claim = db.prepare(`UPDATE payment_authorizations SET status='charging' WHERE state=? AND status='pending'`);
+  check("el primer claim marca 'charging'", claim.run("st_abc123").changes === 1);
+  check("un segundo claim NO vuelve a cambiar la fila (no se cobra dos veces)", claim.run("st_abc123").changes === 0);
+  check("la fila queda en 'charging' (estado intermedio auditable)",
+    one(`SELECT status FROM payment_authorizations WHERE state='st_abc123'`).status === "charging");
+  // El vínculo con la empresa es una FK real: no se puede inventar una empresa.
+  let fkBlocked = false;
+  try { run(`INSERT INTO payment_authorizations (state, company_id, plan, status, created_at, expires_at) VALUES (?,?,?,?,?,?)`,
+            "st_fake", "empresa_inexistente", "pro", "pending", now, now + 600); }
+  catch { fkBlocked = true; }
+  check("un state para una empresa inexistente es rechazado por la FK", fkBlocked);
+  const dup = (() => { try { run(`INSERT INTO payment_authorizations (state, company_id, plan, status, created_at, expires_at) VALUES (?,?,?,?,?,?)`,
+            "st_abc123", "c1", "pro", "pending", now, now + 600); return false; } catch { return true; } })();
+  check("el mismo state no se puede insertar dos veces", dup);
+}
+
 console.log("\n10) Transferencias (un envío se resuelve una vez)");
 run(`INSERT INTO inventory_locations (id,company_id,name,type,owner_user_id,active,created_at)
      VALUES (?,?,?,?,?,1,?)`, "caja_u1", "c1", "Caja - Cajero", "caja", "u1", now);

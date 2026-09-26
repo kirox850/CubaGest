@@ -58,6 +58,31 @@ export const platformAuditLogs = sqliteTable("platform_audit_logs", {
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
 });
 
+// Autorización de pago de un solo uso (migration 0008).
+//
+// Antes, el callback de QvaPay traía `remote_id = "<companyId>:<plan>"` y el
+// backend leía empresa y plan de la URL: cualquiera podía abrir esa URL con
+// el id de una empresa y activarle un plan pagado, o cambiarle el user_uuid
+// al que se le cobra la renovación. Ahora `state` es un token aleatorio de
+// 256 bits creado por el propio admin al pulsar "Activar plan", y esta tabla
+// es la única fuente de verdad de a qué empresa y plan pertenece.
+export const paymentAuthorizations = sqliteTable("payment_authorizations", {
+  state: text("state").primaryKey(),
+  companyId: text("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
+  plan: text("plan").notNull(),
+  userId: text("user_id"),
+  qvapayUserUuid: text("qvapay_user_uuid"),
+  status: text("status", { enum: ["pending", "charging", "charged", "failed"] }).notNull().default("pending"),
+  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+  expiresAt: integer("expires_at", { mode: "timestamp" }).notNull(),
+  completedAt: integer("completed_at", { mode: "timestamp" }),
+  error: text("error"),
+}, (table) => ({
+  statusIdx: index("pa_status_idx").on(table.status),
+  companyIdx: index("pa_company_idx").on(table.companyId),
+  createdIdx: index("pa_created_idx").on(table.createdAt),
+}));
+
 export const users = sqliteTable("users", {
   id: text("id").primaryKey(),
   companyId: text("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),

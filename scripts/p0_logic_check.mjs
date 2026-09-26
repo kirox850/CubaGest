@@ -12,8 +12,10 @@
 //   5) las reglas de descuento: vigencia, tope de usos, ámbito de ubicación,
 //      porcentaje y fijo, y que un descuento nunca supere la base.
 
+import { readFileSync } from "node:fs";
 import { signToken, verifyToken, ACCESS_TOKEN_TTL_SECONDS, REFRESH_TOKEN_TTL_DAYS, PLATFORM_TOKEN_TTL_SECONDS, SUPPORT_TOKEN_TTL_SECONDS } from "../src/lib/jwt.ts";
 import { isDiscountAvailable, computeDiscountAmount } from "../src/lib/discountRules.ts";
+import { classifyChargeFailure } from "../src/lib/qvapay.ts";
 
 const SECRET = "secreto-de-prueba-cubagest";
 let pass = 0;
@@ -132,6 +134,38 @@ check("fijo de venta NO se multiplica por la cantidad",
   computeDiscountAmount({ ...base, type: "fijo", value: 5, scope: "venta" }, 1000, 3) === 5);
 check("el descuento nunca supera la base", computeDiscountAmount({ ...base, value: 100 }, 40) === 40);
 check("nunca devuelve un descuento negativo", computeDiscountAmount({ ...base, value: -5 }, 100) === 0);
+
+console.log("\n5) Fallos de cobro: reintentable vs. rechazo real (cron de QvaPay)");
+const errWith = (status, message = "x") => Object.assign(new Error(message), { status });
+check("429 (límite de 5/20s documentado) → reintentar, NO degradar al cliente",
+  classifyChargeFailure(errWith(429)) === "retry_later");
+check("500 de QvaPay → reintentar", classifyChargeFailure(errWith(500)) === "retry_later");
+check("503 → reintentar", classifyChargeFailure(errWith(503)) === "retry_later");
+check("sin status (error de red) → reintentar", classifyChargeFailure(new Error("fetch failed")) === "retry_later");
+check("400 sin autorización del usuario → rechazo real", classifyChargeFailure(errWith(400)) === "rejected");
+check("404 usuario no encontrado → rechazo real", classifyChargeFailure(errWith(404)) === "rejected");
+check("saldo insuficiente (400) → rechazo real", classifyChargeFailure(errWith(400, "Balance insuficiente")) === "rejected");
+check("un rejection nunca se confunde con un rate limit",
+  classifyChargeFailure(errWith(400)) !== classifyChargeFailure(errWith(429)));
+
+console.log("\n6) Una sola tabla de precios");
+const platformSrc = readFileSync(new URL("../src/routes/platform.ts", import.meta.url), "utf8");
+check("platform.ts ya no define sus propios precios",
+  !/const PLAN_PRICE_USD: Record<string, number>/.test(platformSrc));
+check("platform.ts importa PLAN_PRICES (la de QvaPay)", /import \{ PLAN_PRICES \} from "\.\.\/middleware\/plans"/.test(platformSrc));
+// plans.ts importa hono (no instalado), así que el precio se lee del texto.
+const plansSrc = readFileSync(new URL("../src/middleware/plans.ts", import.meta.url), "utf8");
+const priceOf = (plan) => {
+  const m = plansSrc.match(new RegExp(plan + ":\\s*([0-9.]+)"));
+  return m ? Number(m[1]) : NaN;
+};
+check("el precio real de pro es 5", priceOf("pro") === 5);
+check("el precio real de empresarial es 10", priceOf("empresarial") === 10);
+check("free es 0", priceOf("free") === 0);
+
+console.log("\n7) El proxy del frontend reenvía la IP real");
+const proxySrc = readFileSync(new URL("../../CubaGest-Web/functions/api/[[path]].ts", import.meta.url), "utf8");
+check("functions/api/[[path]].ts reenvía cf-connecting-ip", /headers\.set\("cf-connecting-ip"/.test(proxySrc));
 
 console.log(`\n${fail === 0 ? "✅" : "❌"} resultado: ${pass} ok, ${fail} fallos`);
 process.exit(fail === 0 ? 0 : 1);

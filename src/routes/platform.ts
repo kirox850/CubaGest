@@ -5,6 +5,7 @@ import * as schema from "../db/schema";
 import { signToken, verifyToken, generateUUID, SUPPORT_TOKEN_TTL_SECONDS, PLATFORM_TOKEN_TTL_SECONDS } from "../lib/jwt";
 import { hashPassword, comparePassword } from "../lib/hash";
 import { getClientIp } from "../lib/audit";
+import { PLAN_PRICES } from "../middleware/plans";
 import { createMiddleware } from "hono/factory";
 
 // ─── PANEL DE PLATAFORMA (super-admin) ───────────────────────────────────────
@@ -15,9 +16,14 @@ import { createMiddleware } from "hono/factory";
 //    de companyId — el resto del sistema sigue aislado igual que siempre.
 //  - TODA acción queda registrada en platform_audit_logs.
 
-// Precios estimados para la métrica de ingreso (USD/mes) — AJUSTA a tus
-// precios reales de QvaPay cuando quieras; solo afecta el número mostrado.
-const PLAN_PRICE_USD: Record<string, number> = { free: 0, pro: 8, empresarial: 15 };
+// MRR: se usa la MISMA tabla de precios que cobra QvaPay
+// (middleware/plans.ts → PLAN_PRICES: pro 5, empresarial 10 USD).
+//
+// Antes vivía aquí una segunda constante, PLAN_PRICE_USD (pro 8,
+// empresarial 15), que solo servía para este número. Con customers reales el
+// panel llegaba a sumar hasta un 60% más de lo que realmente entra: el
+// dashboard decía 8 cuando se cobraban 5. Un solo precio, en un solo sitio.
+const PLAN_PRICE_USD = PLAN_PRICES;
 
 const platform = new Hono<{ Bindings: Env }>();
 
