@@ -396,4 +396,65 @@ export async function renewQvapaySubscriptions(env: Env) {
   }
 }
 
+// ── Barrido de autorizaciones de pago (0008) ────────────────────────────────
+// Corre en el mismo cron diario. Hace dos cosas, ambas de mantenimiento:
+//
+// 1) RECONCILIACIÓN (lo importante). Una autorización que se quedó en
+//    'charging' más de una hora significa que el Worker murió (o se cortó la
+//    conexión) entre "QvaPay aceptó el cargo" y "escribí la suscripción". No se
+//    puede arreglar solo: hay que mirar en QvaPay si el cargo entró y, según
+//    eso, activar a mano o devolver el dinero. Se avisa con los datos justos
+//    para hacerlo, y se deja la fila en 'charging' a propósito: ese estado hace
+//    que el callback responda "charge_failed" sin volver a intentar el cobro,
+//    que es justo lo que evita un doble cobro.
+//
+// 2) LIMPIEZA. Cada clic en "Activar plan" crea una fila. A los 30 días ya no
+//    sirven para nada, así que se van.
+const STUCK_CHARGING_MS = 60 * 60 * 1000;         // 1 hora
+const AUTH_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // 30 días
+
+export async function sweepPaymentAuthorizations(env: Env) {
+  const db = drizzle(env.DB, { schema });
+  const now = Date.now();
+
+  // 1) Reconciliación
+  const stuck = await db.select().from(schema.paymentAuthorizations)
+    .where(and(
+      eq(schema.paymentAuthorizations.status, "charging"),
+      lte(schema.paymentAuthorizations.createdAt, new Date(now - STUCK_CHARGING_MS)),
+    )).all();
+
+  for (const row of stuck) {
+    const company = await db.select().from(schema.companies)
+      .where(eq(schema.companies.id, row.companyId)).get();
+    console.error(
+      "QvaPay: REVISAR EN QVAPAY — autorización a medias. Comprueba si el cargo se aplicó; " +
+      "si se aplicó, activa la suscripción a mano; si no, el cliente puede reintentar.",
+      JSON.stringify({
+        state: row.state,
+        companyId: row.companyId,
+        company: company?.name ?? "(desconocida)",
+        plan: row.plan,
+        amount: PLAN_PRICES[row.plan as keyof typeof PLAN_PRICES] ?? null,
+        qvapayUserUuid: row.qvapayUserUuid,
+        startedAt: new Date(row.createdAt).toISOString(),
+      }),
+    );
+    // Se anota, pero NO se cambia el estado: 'charging' es lo que impide que
+    // un refresco de la página vuelva a cobrar.
+    await db.update(schema.paymentAuthorizations)
+      .set({ error: "posiblemente cobrado: revisar manualmente en QvaPay" })
+      .where(eq(schema.paymentAuthorizations.state, row.state));
+  }
+
+  // 2) Limpieza
+  const cutoff = new Date(now - AUTH_RETENTION_MS);
+  const purge = await db.delete(schema.paymentAuthorizations)
+    .where(lte(schema.paymentAuthorizations.createdAt, cutoff)).run();
+  const removed = (purge as any)?.meta?.changes ?? 0;
+  if (removed > 0) {
+    console.log(`QvaPay: barrido — ${removed} autorizaciones de hace más de 30 días eliminadas`);
+  }
+}
+
 export default subscriptions;

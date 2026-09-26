@@ -8,7 +8,7 @@ import sync from "./routes/sync";      // FIX: sync antes que sales
 import sales from "./routes/sales";    // FIX: sales después de sync
 import invoices from "./routes/invoices";
 import accounting from "./routes/accounting";
-import subscriptions, { renewQvapaySubscriptions } from "./routes/subscriptions";
+import subscriptions, { renewQvapaySubscriptions, sweepPaymentAuthorizations } from "./routes/subscriptions";
 import dashboard from "./routes/dashboard";
 import closing from "./routes/closing";
 import locations from "./routes/locations";
@@ -60,8 +60,14 @@ export default {
   fetch: app.fetch,
 
   // Cron trigger (ver [triggers] en wrangler.toml): cobra automáticamente
-  // las suscripciones QvaPay cuyo próximo pago ya venció.
+  // las suscripciones QvaPay cuyo próximo pago ya venció, y después barre las
+  // autorizaciones de pago viejas o que se quedaron a medias.
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
     ctx.waitUntil(renewQvapaySubscriptions(env));
+    // Va aparte (y en paralelo) para que un fallo en el barrido —o en las
+    // renovaciones— no se lleve por delante al otro. Las renovaciones pueden
+    // tardar hasta ~100 s por el ritmo de QvaPay, así que encadenarlas
+    // detrás añadiría esa espera a un trabajo que debería ser instantáneo.
+    ctx.waitUntil(sweepPaymentAuthorizations(env));
   },
 };

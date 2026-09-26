@@ -299,6 +299,39 @@ console.log("\n11) Autorizaciones de pago de un solo uso (0008)");
   check("el mismo state no se puede insertar dos veces", dup);
 }
 
+console.log("\n12) Barrido de autorizaciones (reconciliación + limpieza)");
+{
+  const hourAgo = now - 3600;
+  const old = now - 40 * 86400;
+  const ins = (state, status, createdAt) =>
+    run(`INSERT INTO payment_authorizations (state, company_id, plan, user_id, status, created_at, expires_at)
+         VALUES (?,?,?,?,?,?,?)`, state, "c1", "pro", "u1", status, createdAt, createdAt + 600);
+  ins("fresh_charging", "charging", now);
+  ins("old_charging", "charging", hourAgo - 60);
+  ins("old_charged", "charged", old);
+  ins("old_failed", "failed", old);
+
+  // Esta es EXACTAMENTE la consulta del barrido (sweepPaymentAuthorizations):
+  // solo 'charging' y más viejo que una hora.
+  const stuck = db.prepare(
+    `SELECT state FROM payment_authorizations WHERE status='charging' AND created_at <= ?`).all(hourAgo);
+  check("detecta la autorización a medias de hace más de una hora",
+    stuck.length === 1 && stuck[0].state === "old_charging", JSON.stringify(stuck));
+  check("NO marca una 'charging' que acaba de empezar", !stuck.some((r) => r.state === "fresh_charging"));
+  check("NO confunde una autorización ya cobrada con una a medias", !stuck.some((r) => r.state === "old_charged"));
+
+  // Y la limpieza: nada de esto sirve después de 30 días.
+  const purge = db.prepare(`DELETE FROM payment_authorizations WHERE created_at <= ?`).run(now - 30 * 86400);
+  check("el barrido borra las de más de 30 días", purge.changes === 2, `borradas: ${purge.changes}`);
+  // Las recientes sobreviven TODAS (incluidas las de secciones anteriores).
+  const kept = db.prepare(`SELECT state FROM payment_authorizations ORDER BY state`).all().map((r) => r.state);
+  check("conserva todas las recientes para poder auditar",
+    kept.includes("fresh_charging") && kept.includes("old_charging") && kept.includes("st_abc123"),
+    JSON.stringify(kept));
+  check("no queda ninguna de más de 30 días",
+    !kept.includes("old_charged") && !kept.includes("old_failed"));
+}
+
 console.log("\n10) Transferencias (un envío se resuelve una vez)");
 run(`INSERT INTO inventory_locations (id,company_id,name,type,owner_user_id,active,created_at)
      VALUES (?,?,?,?,?,1,?)`, "caja_u1", "c1", "Caja - Cajero", "caja", "u1", now);
