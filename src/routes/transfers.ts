@@ -6,6 +6,7 @@ import { authMiddleware } from "../middleware/auth";
 import { requireModule } from "../middleware/roles";
 import { generateUUID } from "../lib/jwt";
 import { logAudit, getClientIp } from "../lib/audit";
+import { notify, transferRecipientsOrAdmins } from "../lib/push";
 import { resolveOwnLocation, getLocationStockQty, getActiveCompanyLocation } from "../lib/locations";
 import {
   ensureLocationStockStmt,
@@ -54,6 +55,48 @@ const RESOLVE_403 = {
   error: "Solo quien recibe el envío (el dueño de la ubicación de destino) puede aprobarlo o rechazarlo",
   code: "TRANSFER_NOT_RECIPIENT",
 };
+
+// Avisa a quien pidió el envío de que ya se resolvió. Se usa tanto para el
+// "aprobado" como para el "rechazado": el texto cambia, el destinatario es el
+// mismo (requestedById).
+//
+// Si el motivo del rechazo viene vacío, se dice "sin motivo" en vez de inventar
+// uno: quien lo rechazó debería haber escrito algo, y si no lo hizo, mejor que
+// el remitente lo sepa así.
+async function notifyTransferResolved(
+  c: any,
+  db: any,
+  auth: { companyId: string; userId: string },
+  transfer: typeof schema.stockTransfers.$inferSelect,
+  status: "aprobado" | "rechazado",
+  frase: string
+) {
+  try {
+    if (transfer.requestedById === auth.userId) return; // no avisarse a uno mismo
+    const [quien, destino] = await Promise.all([
+      db.select({ name: schema.users.name }).from(schema.users).where(eq(schema.users.id, auth.userId)).get(),
+      db.select({ name: schema.inventoryLocations.name }).from(schema.inventoryLocations)
+        .where(eq(schema.inventoryLocations.id, transfer.toLocationId)).get(),
+    ]);
+    const motivo = status === "rechazado" && transfer.rejectReason
+      ? ` Motivo: ${transfer.rejectReason}`
+      : "";
+    void notify({
+      env: c.env,
+      db,
+      companyId: auth.companyId,
+      userIds: [transfer.requestedById],
+      type: `transfer.${status}`,
+      title: status === "aprobado" ? "Tu envío fue aprobado" : "Tu envío fue rechazado",
+      body: `${quien?.name ?? "Alguien"} resolvió el envío a ${destino?.name ?? "otra ubicación"}: ${frase}.${motivo}`,
+      link: `/transfers?highlight=${transfer.id}`,
+      data: { transferId: transfer.id, kind: `transfer.${status}` },
+      waitUntil: (p) => c.executionCtx.waitUntil(p),
+    });
+  } catch (err) {
+    console.error("push: no se pudo avisar al remitente:", errorMessage(err));
+  }
+}
 
 // POST /transfers — crear un envío. El origen es la ubicación propia del
 // usuario (almacenista → almacén, cajero → su caja); admin debe indicar
@@ -163,6 +206,33 @@ transfers.post("/", async (c) => {
 
   const transfer = await db.select().from(schema.stockTransfers)
     .where(and(eq(schema.stockTransfers.id, transferId), eq(schema.stockTransfers.companyId, auth.companyId))).get();
+
+  // Aviso a quien tiene que aprobar. Sin esto el envío se queda quieto en
+  // "pendiente" hasta que la persona se acuerde de mirar la pantalla: el
+  // stock sigue en el origen y el almacén de destino no sabe que le llegó algo.
+  // Los productos van en el texto porque sin ellos no hay forma de saber de
+  // qué se trata sin abrir la app.
+  const paraQuien = await transferRecipientsOrAdmins(db, auth.companyId, toLocation.id);
+  if (paraQuien.length > 0) {
+    const resumen = itemRows.length === 1
+      ? `${itemRows[0].qty} × ${itemRows[0].productName}`
+      : `${itemRows.length} productos (${itemRows.slice(0, 2).map((i) => i.productName).join(", ")}${itemRows.length > 2 ? "…" : ""})`;
+    const nombreRemitente = await db.select({ name: schema.users.name }).from(schema.users)
+      .where(eq(schema.users.id, auth.userId)).get();
+    void notify({
+      env: c.env,
+      db,
+      companyId: auth.companyId,
+      userIds: paraQuien,
+      type: "transfer.created",
+      title: "Tienes un envío por aprobar",
+      body: `${nombreRemitente?.name ?? "Alguien"} te envió ${resumen} a ${toLocation.name}.`,
+      link: `/transfers?highlight=${transferId}`,
+      data: { transferId, kind: "transfer.created" },
+      waitUntil: (p) => c.executionCtx.waitUntil(p),
+    });
+  }
+
   return c.json({ ok: true, data: await attachItems(db, transfer!) }, 201);
 });
 
@@ -273,6 +343,11 @@ transfers.post("/:id/approve", async (c) => {
 
   const updated = await db.select().from(schema.stockTransfers)
     .where(eq(schema.stockTransfers.id, id)).get();
+
+  // Al remitente le importa: el stock ya salió de su ubicación. Si se queda sin
+  // avisar, sigue pensando que lo tiene.
+  void notifyTransferResolved(c, db, auth, transfer, "aprobado", "salió de tu ubicación");
+
   return c.json({ ok: true, data: await attachItems(db, updated!) });
 });
 
@@ -313,6 +388,8 @@ transfers.post("/:id/reject", async (c) => {
     detail: { reason: (body.reason || "").trim() || null },
     ip: getClientIp(c),
   });
+
+  void notifyTransferResolved(c, db, auth, transfer, "rechazado", "no salió de tu ubicación");
 
   return c.json({ ok: true, data: await attachItems(db, updated!) });
 });

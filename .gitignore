@@ -31,3 +31,6 @@ Thumbs.db
 
 # Los scripts de verificación (scripts/p0_*.mjs) SÍ se versionan a propósito:
 # son pruebas de integridad ejecutables sin instalar nada.
+
+# Copias de seguridad de la base de datos (datos de clientes)
+backups/

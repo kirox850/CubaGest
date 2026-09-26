@@ -163,9 +163,49 @@ check("el precio real de pro es 5", priceOf("pro") === 5);
 check("el precio real de empresarial es 10", priceOf("empresarial") === 10);
 check("free es 0", priceOf("free") === 0);
 
-console.log("\n7) El proxy del frontend reenvía la IP real");
+console.log("\n7) Cancelar la suscripción existe Y detiene el cobro");
+const subsSrc = readFileSync(new URL("../src/routes/subscriptions.ts", import.meta.url), "utf8");
+const modalSrc = readFileSync(new URL("../../CubaGest-Web/src/screens/PlanModal.tsx", import.meta.url), "utf8");
+check("hay una ruta POST /subscription/cancel", /subscriptions\.post\("\/cancel"/.test(subsSrc));
+check("cancelar solo lo puede hacer un admin", /post\("\/cancel", authMiddleware, requireRole\("admin"\)/.test(subsSrc));
+check("al cancelar se vacía la fecha del próximo cobro (el cron cobra por ahí)",
+  /subscriptionStatus: "cancelled",[\s\S]{0,400}?nextPaymentDate: null,/.test(subsSrc));
+check("el cron se salta a las empresas canceladas",
+  /subscriptionStatus !== "cancelled"/.test(subsSrc));
+check("el panel tiene el botón de cancelar", /handleCancel/.test(modalSrc) && /Cancelar suscripci/.test(modalSrc));
+check("ya no se dice 'escríbenos para cancelar'", !/escr[ií]benos antes de la fecha/.test(modalSrc));
+
+console.log("\n8) Los tres avisos que tienen que dispararse");
+{
+  const trSrc = readFileSync(new URL("../src/routes/transfers.ts", import.meta.url), "utf8");
+  const clSrc = readFileSync(new URL("../src/routes/closing.ts", import.meta.url), "utf8");
+  const pushLib = readFileSync(new URL("../src/lib/push.ts", import.meta.url), "utf8");
+  const swSrc = readFileSync(new URL("../../CubaGest-Web/public/sw.js", import.meta.url), "utf8");
+  const bellSrc = readFileSync(new URL("../../CubaGest-Web/src/components/shared/NotificationsBell.tsx", import.meta.url), "utf8");
+
+  check("crear un envío avisa a quien lo recibe", /transferRecipientsOrAdmins/.test(trSrc) && /transfer\.created/.test(trSrc));
+  check("aprobar un envío avisa a quien lo pidió", /notifyTransferResolved\(c, db, auth, transfer, "aprobado"/.test(trSrc));
+  check("rechazar un envío avisa a quien lo pidió", /notifyTransferResolved\(c, db, auth, transfer, "rechazado"/.test(trSrc));
+  check("el motivo del rechazo viaja en el aviso", /transfer\.rejectReason/.test(trSrc));
+  check("un cierre con faltante avisa a los admins", /closing\.shortage/.test(clSrc) && /adminsOf\(db, auth\.companyId\)/.test(clSrc));
+  check("el aviso de faltante solo sale si hubo faltante", /if \(hasShortage\)/.test(clSrc));
+  check("el aviso se manda sin bloquear la respuesta (waitUntil)", /waitUntil/.test(trSrc) && /waitUntil/.test(clSrc));
+  check("el aviso se guarda en la base ANTES de empujarlo", pushLib.indexOf("db.insert(schema.notifications)") < pushLib.indexOf("pushToBrowsers(env"));
+  check("un aviso nunca rompe la venta que lo disparó", /console\.error\(`push: no se pudo registrar/.test(pushLib));
+  check("un navegador muerto (404/410) se borra de la lista", /status === 404 \|\| status === 410/.test(pushLib));
+  check("un fallo del servicio NO borra la suscripción (se reintenta)", /status === 404/.test(pushLib) && /failures: sub\.failures \+ 1/.test(pushLib));
+  check("el service worker muestra el aviso", /addEventListener\('push'/.test(swSrc) && /showNotification/.test(swSrc));
+  check("al tocar el aviso se abre la pantalla indicada", /addEventListener\('notificationclick'/.test(swSrc));
+  check("la lista sale de la base, no del push (si el push falla, se ve igual)", /apiFetch\("\/push\/notifications/.test(bellSrc));
+  check("el permiso NO se pide al arrancar (se pregunta en la campanita)", !/requestPermission/.test(bellSrc));
+}
+
+console.log("\n9) El proxy del frontend reenvía la IP real");
 const proxySrc = readFileSync(new URL("../../CubaGest-Web/functions/api/[[path]].ts", import.meta.url), "utf8");
 check("functions/api/[[path]].ts reenvía cf-connecting-ip", /headers\.set\("cf-connecting-ip"/.test(proxySrc));
+check("el proxy corta si el backend se cuelga (AbortController)",
+  /new AbortController\(\)/.test(proxySrc) && /controller\.abort\(\)/.test(proxySrc));
+check("y devuelve un error claro en vez de colgarse", /504/.test(proxySrc) && /tardó demasiado/.test(proxySrc));
 
 console.log(`\n${fail === 0 ? "✅" : "❌"} resultado: ${pass} ok, ${fail} fallos`);
 process.exit(fail === 0 ? 0 : 1);

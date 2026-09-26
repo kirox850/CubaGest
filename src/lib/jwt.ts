@@ -35,22 +35,31 @@ export interface JWTPayload {
   iat: number;
 }
 
-function base64UrlEncode(buf: ArrayBuffer): string {
+// Acepta ArrayBuffer o TypedArray. crypto.subtle devuelve ArrayBuffer y los
+// helpers de texto devuelven Uint8Array; ambos se leen igual aquí abajo con
+// `new Uint8Array(...)`, así que el tipo declarado no puede ser solo uno.
+// (Ver la nota de Uint8Array en lib/hash.ts: TS 5.7+ separó los dos tipos.)
+function base64UrlEncode(buf: ArrayBuffer | Uint8Array): string {
   return btoa(String.fromCharCode(...new Uint8Array(buf)))
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
     .replace(/=+$/, "");
 }
 
-function base64UrlDecode(str: string): Uint8Array {
+// El tipo de vuelta es `Uint8Array<ArrayBuffer>` y no `Uint8Array` a secas:
+// la firma decodificada se le pasa directo a crypto.subtle.verify, que desde
+// TS 5.7 exige un buffer que no sea SharedArrayBuffer.
+function base64UrlDecode(str: string): Uint8Array<ArrayBuffer> {
   const padding = "=".repeat((4 - (str.length % 4)) % 4);
   const base64 = str.replace(/-/g, "+").replace(/_/g, "/") + padding;
   const binary = atob(base64);
   return Uint8Array.from(binary, (c) => c.charCodeAt(0));
 }
 
-function textEncoder(str: string): Uint8Array {
-  return new TextEncoder().encode(str);
+// Se devuelve una copia respaldada por ArrayBuffer (no SharedArrayBuffer) porque
+// crypto.subtle solo acepta ese tipo desde TS 5.7. La copia son unos bytes.
+function textEncoder(str: string): Uint8Array<ArrayBuffer> {
+  return new Uint8Array(new TextEncoder().encode(str));
 }
 
 async function importKey(secret: string): Promise<CryptoKey> {

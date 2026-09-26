@@ -20,7 +20,12 @@ export interface DiscountRow {
 }
 
 // ¿Está disponible este descuento para usar en la ubicación dada?
-export function isDiscountAvailable(d: DiscountRow, locationId: string, now = new Date()): { ok: boolean; reason?: string } {
+//
+// El retorno es una unión discriminada a propósito: `reason` solo existe cuando
+// `ok` es false, y TypeScript lo sabe. Con el tipo anterior ({ok: boolean;
+// reason?: string}) cualquier llamada tenía que inventarse un motivo por si
+// acaso, y una de ellas pasaba `undefined` donde la función pedía un texto.
+export function isDiscountAvailable(d: DiscountRow, locationId: string, now = new Date()): { ok: true } | { ok: false; reason: string } {
   if (!d.active) return { ok: false, reason: "Descuento inactivo" };
   const endsAt = d.endsAt ? new Date(d.endsAt as any) : null;
   if (d.startsAt && now < new Date(d.startsAt as any)) return { ok: false, reason: "Descuento aún no vigente" };

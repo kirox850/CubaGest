@@ -18,6 +18,7 @@ import discounts from "./routes/discounts";
 import settings from "./routes/settings";
 import platform from "./routes/platform";
 import referrals from "./routes/referrals";
+import push from "./routes/push";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -50,6 +51,7 @@ app.route("/discounts", discounts);
 app.route("/settings", settings);
 app.route("/platform", platform);
 app.route("/referrals", referrals);
+app.route("/push", push);
 
 app.onError((err, c) => {
   console.error(err);

@@ -30,6 +30,7 @@ db.exec("PRAGMA foreign_keys = ON;");
 const allFiles = readdirSync(migrationsDir).filter((f) => f.endsWith(".sql")).sort();
 const p0File = "0007_p0_integrity.sql";
 const p0bFile = "0008_payment_authorizations.sql";
+const p0cFile = "0009_push_notifications.sql";
 
 function applyMigrations(files) {
   for (const file of files) {
@@ -65,7 +66,7 @@ function throws(name, fn, expectMsg) {
   }
 }
 
-applyMigrations(allFiles.filter((f) => f !== p0File && f !== p0bFile));
+applyMigrations(allFiles.filter((f) => f !== p0File && f !== p0bFile && f !== p0cFile));
 
 const now = Math.floor(Date.now() / 1000);
 const one = (sql, ...p) => db.prepare(sql).get(...p);
@@ -84,7 +85,7 @@ check("antes de 0007 la empresa NO tiene company_settings",
   !one(`SELECT company_id FROM company_settings WHERE company_id='c1'`));
 
 console.log("\n0) Se aplican 0007 y 0008 sobre el estado heredado");
-applyMigrations([p0File, p0bFile]);
+applyMigrations([p0File, p0bFile, p0cFile]);
 
 // ── 1) Backfill de empresa que existía antes de la migration ───────────────
 console.log("\n1) Backfill de empresa creada antes de la migration");
@@ -330,6 +331,92 @@ console.log("\n12) Barrido de autorizaciones (reconciliación + limpieza)");
     JSON.stringify(kept));
   check("no queda ninguna de más de 30 días",
     !kept.includes("old_charged") && !kept.includes("old_failed"));
+}
+
+console.log("\n13) Avisos del navegador (0009)");
+{
+  // ── Suscripciones ──
+  // Segunda empresa: sirve para comprobar que los avisos de una NUNCA se ven
+  // desde la otra. Es el aislamiento entre inquilinos.
+  // Los usuarios que usa esta sección: uno en cada empresa. El seed general
+  // solo crea "u1" en c1, y aquí hace falta alguien de c2 para comprobar que
+  // un aviso de una empresa no aparece en la otra.
+  if (!db.prepare(`SELECT id FROM users WHERE id='u_c2'`).get()) {
+    run(`INSERT INTO users (id,company_id,name,email,password_hash,role,active,created_at)
+         VALUES (?,?,?,?,?,'cajero',1,?)`, "u_c2", "c2", "Cajero 2", "c2@x.com", "x", now);
+  }
+  const sub = (endpoint, companyId, userId) =>
+    run(`INSERT INTO push_subscriptions (id, company_id, user_id, endpoint, p256dh, auth)
+         VALUES (?,?,?,?,'pub','aut')`, `s_${endpoint}`, companyId, userId, endpoint);
+  sub("https://fcm.example/A", "c1", "u1");
+  sub("https://fcm.example/B", "c1", "u1");
+  check("la suscripción guarda a qué navegador pertenece", one(`SELECT company_id FROM push_subscriptions WHERE endpoint='https://fcm.example/A'`).company_id === "c1");
+
+  const dupEndpoint = (() => {
+    try { sub("https://fcm.example/A", "c2", "u_c2"); return false; } catch { return true; }
+  })();
+  check("un mismo navegador NO se puede registrar dos veces", dupEndpoint,
+    "el endpoint es UNIQUE: sin esto, cada recarga duplicaría los avisos");
+
+  // Reasignar: el mismo navegador entra con otra cuenta.
+  db.prepare(`UPDATE push_subscriptions SET company_id=?, user_id=? WHERE endpoint=?`).run("c2", "u_c2", "https://fcm.example/A");
+  check("si el navegador entra con otra cuenta, los avisos van a la nueva",
+    one(`SELECT company_id FROM push_subscriptions WHERE endpoint='https://fcm.example/A'`).company_id === "c2");
+
+  // Aislamiento: los avisos de una empresa NUNCA son visibles para otra.
+  check("las suscripciones están separadas por empresa",
+    db.prepare(`SELECT COUNT(*) n FROM push_subscriptions WHERE company_id='c1'`).get().n === 1);
+
+  // ── Avisos ──
+  run(`INSERT INTO notifications (id, company_id, user_id, type, title, body, created_at)
+       VALUES (?,?,?,?,?,?,?)`, "n1", "c1", null, "transfer.created", "Tienes un envío", "para todos", now);
+  run(`INSERT INTO notifications (id, company_id, user_id, type, title, body, created_at)
+       VALUES (?,?,?,?,?,?,?)`, "n2", "c1", "u1", "closing.shortage", "Faltante", "solo para u1", now);
+  run(`INSERT INTO notifications (id, company_id, user_id, type, title, body, created_at)
+       VALUES (?,?,?,?,?,?,?)`, "n3", "c2", null, "transfer.created", "Otra empresa", "no debe verse", now);
+
+  check("el aviso de empresa (user_id NULL) se guarda", one(`SELECT user_id FROM notifications WHERE id='n1'`).user_id === null);
+  check("el aviso personal guarda su user_id", one(`SELECT user_id FROM notifications WHERE id='n2'`).user_id === "u1");
+
+  // La regla que decide a quién se muestra: user_id IS NULL (empresa) O el mío.
+  const visibles = db.prepare(
+    `SELECT id FROM notifications WHERE company_id='c1' AND (user_id IS NULL OR user_id='u1') ORDER BY id`
+  ).all().map((r) => r.id);
+  check("el usuario ve los de su empresa y los suyos", visibles.length === 2 && visibles.includes("n1") && visibles.includes("n2"), JSON.stringify(visibles));
+
+  const otro = db.prepare(
+    `SELECT id FROM notifications WHERE company_id='c1' AND (user_id IS NULL OR user_id='u1')`
+  ).all().length;
+  check("nunca se ve un aviso de otra empresa", !visibles.includes("n3") && otro === 2);
+
+  // Un aviso personal de OTRA persona de la misma empresa no se ve.
+  run(`INSERT INTO notifications (id, company_id, user_id, type, title, body, created_at)
+       VALUES (?,?,?,?,?,?,?)`, "n4", "c1", "u_c2", "closing.shortage", "Faltante de otro", "privado", now);
+  const despues = db.prepare(
+    `SELECT id FROM notifications WHERE company_id='c1' AND (user_id IS NULL OR user_id='u1')`
+  ).all().map((r) => r.id);
+  check("el aviso personal de un compañero NO se ve", !despues.includes("n4"), JSON.stringify(despues));
+
+  // Sin leer
+  const sinLeer = db.prepare(`SELECT COUNT(*) n FROM notifications WHERE company_id='c1' AND read_at IS NULL`).get().n;
+  check("los avisos nuevos cuentan como no leídos", sinLeer === 3, `n=${sinLeer}`);
+  db.prepare(`UPDATE notifications SET read_at=? WHERE company_id='c1' AND id='n1'`).run(now);
+  check("al marcar uno como leído solo ese deja de contar",
+    db.prepare(`SELECT COUNT(*) n FROM notifications WHERE company_id='c1' AND read_at IS NULL`).get().n === 2);
+
+  // Si la empresa se borra, sus avisos y suscripciones se van con ella.
+  // ON DELETE CASCADE: sin esto, al borrar una empresa sus avisos seguirían en
+  // la base y algún día se verían en otra cuenta.
+  run(`INSERT INTO companies (id,name,plan,active,created_at) VALUES (?,?,?,1,?)`, "c9", "Empresa Para Borrar", "free", now);
+  run(`INSERT INTO push_subscriptions (id, company_id, user_id, endpoint, p256dh, auth)
+       VALUES (?,?,?,?,'pub','aut')`, "s_z", "c9", "u1", "https://fcm.example/Z");
+  run(`INSERT INTO notifications (id, company_id, user_id, type, title, body, created_at)
+       VALUES (?,?,?,?,?,?,?)`, "n9", "c9", null, "x", "borrar", "cascada", now);
+  db.prepare(`DELETE FROM companies WHERE id='c9'`).run();
+  check("borrar la empresa borra sus suscripciones",
+    db.prepare(`SELECT COUNT(*) n FROM push_subscriptions WHERE company_id='c9'`).get().n === 0);
+  check("borrar la empresa borra sus avisos",
+    db.prepare(`SELECT COUNT(*) n FROM notifications WHERE company_id='c9'`).get().n === 0);
 }
 
 console.log("\n10) Transferencias (un envío se resuelve una vez)");

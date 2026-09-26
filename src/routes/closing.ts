@@ -6,6 +6,7 @@ import { authMiddleware } from "../middleware/auth";
 import { requireModule, requireRole } from "../middleware/roles";
 import { generateUUID } from "../lib/jwt";
 import { logAudit, getClientIp } from "../lib/audit";
+import { notify, adminsOf } from "../lib/push";
 import { resolveOwnLocation, getLocationStockQty, getActiveCompanyLocation } from "../lib/locations";
 import {
   auditStmt,
@@ -438,7 +439,7 @@ closing.post("/confirm", requireModule("cierre"), async (c) => {
   }
 
   stmts.push(
-    auditStmt(c.env, {
+    auditStmt(c.env.DB, {
       companyId: auth.companyId, userId: auth.userId,
       action: "closing.confirm", entity: "cash_closing", entityId: closingId,
       detail: {
@@ -465,6 +466,38 @@ closing.post("/confirm", requireModule("cierre"), async (c) => {
 
   const closingRecord = await db.select().from(schema.cashClosings)
     .where(eq(schema.cashClosings.id, closingId)).get();
+
+  // El cierreGUARDÓ bien, pero el conteo físico no cuadró. Eso no es un error
+  // técnico: es dinero que falta, y quien tiene que enterarse es el dueño, no
+  // el cajero que ya cerró su turno. Se avisa a los admins de la empresa.
+  if (hasShortage) {
+    const faltantes = closingItems.filter((i) => i.shortage > 0.001);
+    // Sin monto: aquí no está el precio unitario, y un importe estimado en un
+    // aviso sobre el que el dueño va a actuar es peor que no poner nada. Lo
+    // que sí es exacto es cuántas unidades faltaron.
+    const unidades = faltantes.reduce((a, i) => a + i.shortage, 0);
+    const detalle = faltantes.length === 1
+      ? `${Math.round(faltantes[0].shortage * 100) / 100} ${faltantes[0].unit || "ud"} de ${faltantes[0].productName}`
+      : `${Math.round(unidades * 100) / 100} unidades en ${faltantes.length} productos`;
+    const loc = await getActiveCompanyLocation(db, auth.companyId, locationId);
+    const nombreUbicacion = loc?.name ?? "el cierre";
+    const paraAdmins = await adminsOf(db, auth.companyId);
+    if (paraAdmins.length > 0) {
+      void notify({
+        env: c.env,
+        db,
+        companyId: auth.companyId,
+        userIds: paraAdmins,
+        type: "closing.shortage",
+        title: "Cierre de caja con faltante",
+        body: `Faltante en ${nombreUbicacion}: ${detalle}. Revísalo hoy.`,
+        link: "/closing",
+        data: { closingId, kind: "closing.shortage" },
+        waitUntil: (p) => c.executionCtx.waitUntil(p),
+      });
+    }
+  }
+
   return c.json({ ok: true, data: closingRecord }, 201);
 });
 

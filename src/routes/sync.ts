@@ -42,7 +42,10 @@ interface SyncSale {
 sync.post("/", requireModule("pos"), async (c) => {
   const db = drizzle(c.env.DB, { schema });
   const auth = c.get("auth");
-  const body = await c.req.json<{ sales?: SyncSale[]; locationId?: string }>().catch(() => ({}) as { sales?: SyncSale[] });
+  // El fallback del catch lleva el mismo tipo que el parseo: si se sustituye
+  // por uno más pobre, TS crea una unión y luego `body.locationId` deja de
+  // existir en una de las dos ramas (aunque en runtime siempre sea undefined).
+  const body = await c.req.json<{ sales?: SyncSale[]; locationId?: string }>().catch(() => ({}) as { sales?: SyncSale[]; locationId?: string });
 
   const inputSales = body.sales;
   if (!Array.isArray(inputSales) || inputSales.length === 0) {

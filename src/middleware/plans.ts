@@ -18,6 +18,22 @@ export const PLAN_PRICES: Record<string, number> = {
   empresarial: 10,
 };
 
+// Los tres únicos planes que existen. La columna `companies.plan` es un enum en
+// TypeScript, pero `payment_authorizations.plan` es texto libre (guarda lo que
+// pidió el admin), así que hay que validarlo antes de escribirlo en la empresa.
+export const PLAN_KEYS = ["free", "pro", "empresarial"] as const;
+export type PlanKey = (typeof PLAN_KEYS)[number];
+
+// Falla hacia abajo: un plan que no se reconoce NUNCA da acceso de pago. Si
+// aparece uno, es corrupción de datos (alguien editó la fila a mano, o un
+// deploy dejó un valor viejo), y lo correcto es no conceder el plan y dejar
+// rastro en el log, no darle Pro a una empresa que no lo compró.
+export function asPlan(value: string | null | undefined): PlanKey {
+  if (value && (PLAN_KEYS as readonly string[]).includes(value)) return value as PlanKey;
+  console.error(`plans: plan desconocido "${value}" — se trata como free`);
+  return "free";
+}
+
 function getEffectivePlan(company: typeof schema.companies.$inferSelect): string {
   if (company.planExpiry && new Date(company.planExpiry) < new Date()) {
     return "free";

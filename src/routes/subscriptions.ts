@@ -4,7 +4,7 @@ import { drizzle } from "drizzle-orm/d1";
 import * as schema from "../db/schema";
 import { authMiddleware } from "../middleware/auth";
 import { requireRole } from "../middleware/roles";
-import { PLAN_LIMITS, PLAN_PRICES, getPlanInfo } from "../middleware/plans";
+import { PLAN_LIMITS, PLAN_PRICES, getPlanInfo, asPlan } from "../middleware/plans";
 import {
   qvapayAuthorizePayments,
   qvapayCharge,
@@ -52,6 +52,57 @@ subscriptions.get("/status", authMiddleware, async (c) => {
       failedAttempts: company.failedAttempts,
       daysLeft,
       isTrial: company.subscriptionStatus === "trial",
+      // Con estos dos datos el panel puede decir la verdad: "cancelado, te
+      // queda hasta el día X" en vez de un mensaje ambiguo.
+      isCancelled: company.subscriptionStatus === "cancelled",
+      // ¿Va a dejar de cobrarse solo? (cancelado o ya no renueva por no tener
+      // fecha de próximo pago)
+      willRenew: company.subscriptionStatus !== "cancelled" && !!company.nextPaymentDate,
+    },
+  });
+});
+
+// POST /subscription/cancel — cancelar la suscripción.
+//
+// Por qué existe: la app promete al cliente que puede cancelar cuando quiera.
+// Hasta ahora no había ni ruta ni botón, así que la promesa era falsa (y eso
+// es un problema legal, no una molestia).
+//
+// Qué hace exactamente: NO le quita el plan al instante. Deja el acceso hasta
+// que termine el periodo que ya pagó (planExpiry) y a partir de ahí vuelve a
+// free solo, sin que se cobre nada más. Cancelar hoy lo que ya pagó sería
+// justo lo contrario de lo que la gente espera al cancelar.
+//
+// Para que cancelar de verdad PARE el cobro, el cron de renovaciones tiene que
+// saltarse estas empresas (ver renewQvapaySubscriptions).
+subscriptions.post("/cancel", authMiddleware, requireRole("admin"), async (c) => {
+  const db = drizzle(c.env.DB, { schema });
+  const auth = c.get("auth");
+  const company = await db.select().from(schema.companies)
+    .where(eq(schema.companies.id, auth.companyId)).get();
+  if (!company) return c.json({ ok: false, error: "Empresa no encontrada" }, 404);
+
+  if (company.subscriptionStatus === "cancelled") {
+    return c.json({ ok: true, data: { subscriptionStatus: "cancelled", planExpiry: company.planExpiry, alreadyCancelled: true } });
+  }
+  if (company.plan === "free" || !company.planExpiry) {
+    return c.json({ ok: false, error: "No hay un plan de pago que cancelar" }, 400);
+  }
+
+  await db.update(schema.companies).set({
+    subscriptionStatus: "cancelled",
+    // nextPaymentDate se pone a NULL a propósito: es el campo que usa el cron
+    // para decidir a quién cobrar. Así, aunque el código del cron se quedara
+    // como estaba, tampoco tocaría a esta empresa.
+    nextPaymentDate: null,
+  }).where(eq(schema.companies.id, auth.companyId));
+
+  return c.json({
+    ok: true,
+    data: {
+      subscriptionStatus: "cancelled",
+      planExpiry: company.planExpiry,
+      accessUntil: company.planExpiry,
     },
   });
 });
@@ -290,7 +341,10 @@ subscriptions.get("/qvapay-callback", async (c) => {
     qvapayAuthorized: true,
     qvapayUserUuid: payload.user_uuid,
     qvapayAuthSecret: payload.auth_secret || null,
-    plan,
+    // `plan` viene de la fila de autorización, que es texto libre. Se revalida
+    // aquí porque este valor decide a qué plan tiene acceso la empresa:
+    // escribir un plan desconocido le daría acceso que nadie pagó.
+    plan: asPlan(plan),
     planExpiry: nextPaymentDate,
     subscriptionStatus: "active",
     lastPaymentDate: new Date(),
@@ -340,6 +394,10 @@ export async function renewQvapaySubscriptions(env: Env) {
   const candidates = all
     .filter((c) => c.nextPaymentDate && new Date(c.nextPaymentDate) <= now)
     .filter((c) => !!c.qvapayUserUuid && c.plan !== "free")
+    // Cancelado = el cliente dijo que no quiere seguir pagando. NO se cobra.
+    // (nextPaymentDate ya viene en NULL tras cancelar, pero no nos fiamos solo
+    // de eso: si alguien lo rellena a mano o por otro camino, aquí se corta.)
+    .filter((c) => c.subscriptionStatus !== "cancelled")
     // El más vencido primero: si hay más de los que caben en una corrida, el
     // que más días lleva sin cobrar es el primero.
     .sort((a, b) => new Date(a.nextPaymentDate!).getTime() - new Date(b.nextPaymentDate!).getTime())
@@ -357,6 +415,15 @@ export async function renewQvapaySubscriptions(env: Env) {
     done += 1;
 
     const amount = PLAN_PRICES[company.plan];
+    // El filtro de candidatos ya exige qvapayUserUuid, pero se repite aquí la
+    // comprobación: entre que se leen las empresas y que se cobra, alguien
+    // podría haber borrado ese UUID. Cobrar con `user_uuid` vacío haría que
+    // QvaPay cobre a la cuenta equivocada o rechace, así que es mejor saltarse
+    // la empresa y avisar que arriesgarse.
+    if (!company.qvapayUserUuid) {
+      console.error(`QvaPay: la empresa ${company.id} quedó en la cola sin user_uuid; se salta`);
+      continue;
+    }
     try {
       await qvapayCharge(env, {
         amount,
@@ -435,7 +502,7 @@ export async function sweepPaymentAuthorizations(env: Env) {
         companyId: row.companyId,
         company: company?.name ?? "(desconocida)",
         plan: row.plan,
-        amount: PLAN_PRICES[row.plan as keyof typeof PLAN_PRICES] ?? null,
+        amount: PLAN_PRICES[asPlan(row.plan)],
         qvapayUserUuid: row.qvapayUserUuid,
         startedAt: new Date(row.createdAt).toISOString(),
       }),

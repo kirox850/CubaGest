@@ -73,10 +73,13 @@ export const paymentAuthorizations = sqliteTable("payment_authorizations", {
   userId: text("user_id"),
   qvapayUserUuid: text("qvapay_user_uuid"),
   status: text("status", { enum: ["pending", "charging", "charged", "failed"] }).notNull().default("pending"),
-  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
   expiresAt: integer("expires_at", { mode: "timestamp" }).notNull(),
   completedAt: integer("completed_at", { mode: "timestamp" }),
   error: text("error"),
+  // notNull() tiene que estar aquí porque en 0008 la columna es NOT NULL. Sin
+  // esta línea, TypeScript decía `Date | null` y el código se tenía que
+  // defender de un null que la base de datos ya impide.
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
 }, (table) => ({
   statusIdx: index("pa_status_idx").on(table.status),
   companyIdx: index("pa_company_idx").on(table.companyId),
@@ -439,4 +442,47 @@ export const referrals = sqliteTable("referrals", {
 }, (table) => ({
   referrerIdx: index("referrals_referrer_idx").on(table.referrerCompanyId),
   referredIdx: uniqueIndex("referrals_referred_idx").on(table.referredCompanyId),
+}));
+
+// ─── AVISOS DEL NAVEGADOR (0009) ────────────────────────────────────────────
+// Ver migrations/0009_push_notifications.sql para el porqué de cada columna.
+
+// A qué navegador se le puede mandar un aviso. El endpoint es único en toda la
+// base: un mismo navegador no puede quedar en dos empresas ni duplicado.
+export const pushSubscriptions = sqliteTable("push_subscriptions", {
+  id: text("id").primaryKey(),
+  companyId: text("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
+  // Persona concreta desde la que se suscribió. Sirve para no repetirle a
+  // alguien un aviso que ya vio en su propia pantalla.
+  userId: text("user_id").references(() => users.id, { onDelete: "cascade" }),
+  endpoint: text("endpoint").notNull().unique(),
+  p256dh: text("p256dh").notNull(),
+  auth: text("auth").notNull(),
+  userAgent: text("user_agent"),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
+  lastOkAt: integer("last_ok_at", { mode: "timestamp" }),
+  failures: integer("failures").notNull().default(0),
+}, (table) => ({
+  companyIdx: index("push_company_idx").on(table.companyId),
+  userIdx: index("push_user_idx").on(table.userId),
+}));
+
+// El aviso guardado dentro de la app. El push es solo el empujón: esto es lo
+// que la persona ve al abrir, y por eso es la fuente de verdad.
+export const notifications = sqliteTable("notifications", {
+  id: text("id").primaryKey(),
+  companyId: text("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
+  // NULL = para toda la empresa. Con valor = aviso personal de esa persona.
+  userId: text("user_id").references(() => users.id, { onDelete: "cascade" }),
+  type: text("type").notNull(),
+  title: text("title").notNull(),
+  body: text("body").notNull(),
+  link: text("link"),
+  data: text("data"),
+  readAt: integer("read_at", { mode: "timestamp" }),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
+}, (table) => ({
+  companyIdx: index("notif_company_idx").on(table.companyId, table.createdAt),
+  userIdx: index("notif_user_idx").on(table.userId, table.createdAt),
+  unreadIdx: index("notif_unread_idx").on(table.companyId, table.readAt),
 }));
