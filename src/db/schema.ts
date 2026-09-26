@@ -172,6 +172,10 @@ export const shifts = sqliteTable("shifts", {
   endedAt: integer("ended_at", { mode: "timestamp" }),
   status: text("status", { enum: ["abierto", "cerrado"] }).notNull().default("abierto"),
   openingReadingId: text("opening_reading_id").references(() => inventoryReadings.id),
+  // Con cuánto dinero arrancó la caja, por moneda: {"CUP":5000,"USD":20}.
+  // Sin esto no hay forma de saber si un faltante es de este turno o venía
+  // de antes — y sin esa diferencia, la conciliación no significa nada.
+  baseCash: text("base_cash", { mode: "json" }).notNull().$defaultFn(() => ({})),
   notes: text("notes"),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
 }, (table) => ({
@@ -350,9 +354,72 @@ export const cashClosings = sqliteTable("cash_closings", {
   incomeEfectivo: real("income_efectivo").notNull().default(0),
   incomeTransferencia: real("income_transferencia").notNull().default(0),
   items: text("items", { mode: "json" }).notNull().$defaultFn(() => []),
+
+  // ── El dinero, por moneda ──
+  // Se guarda en SU moneda, nunca convertido a una sola: {"CUP":1200,"USD":20}.
+  // Convertir al guardar perdería la información que el dueño necesita para
+  // poder explicar un descuadre.
+  baseCash: text("base_cash", { mode: "json" }).notNull().$defaultFn(() => ({})),
+  countedCash: text("counted_cash", { mode: "json" }).notNull().$defaultFn(() => ({})),
+  expectedCash: text("expected_cash", { mode: "json" }).notNull().$defaultFn(() => ({})),
+  // Contado menos esperado, por moneda. Negativo = falta, positivo = sobra.
+  cashDiff: text("cash_diff", { mode: "json" }).notNull().$defaultFn(() => ({})),
+
+  // "cerrado" queda una vez y todo cuadró; "provisional" tiene un descuadre de
+  // dinero esperando explicación; "resuelto" tuvo descuadre y ya se explicó.
+  status: text("status", { enum: ["cerrado", "provisional", "resuelto"] }).notNull().default("cerrado"),
+  // La HORA DEL CONTEO, no la de la sincronización. El cajero contó a las 8 pero
+  // la caja se subió sin internet al día siguiente: la ventana de 20 horas
+  // corre desde las 8, no desde que volvió la conexión.
+  countedAt: integer("counted_at", { mode: "timestamp" }),
+  // Cuándo vence la ventana para explicar el descuadre.
+  provisionalUntil: integer("provisional_until", { mode: "timestamp" }),
+  shiftId: text("shift_id").references(() => shifts.id),
+
   notes: text("notes"),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
-});
+}, (table) => ({
+  provisionalIdx: index("closings_provisional").on(table.status, table.provisionalUntil),
+}));
+
+// Entradas y salidas de dinero de la caja. Sin esto, un retiro del dueño es
+// indistinguible de un robo para el cierre.
+export const cashMovements = sqliteTable("cash_movements", {
+  id: text("id").primaryKey(),
+  companyId: text("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
+  locationId: text("location_id").notNull().references(() => inventoryLocations.id, { onDelete: "cascade" }),
+  // NULL si lo hizo un admin sin turno abierto: un admin puede mover dinero
+  // cuando quiera, un cajero solo con su turno abierto.
+  shiftId: text("shift_id").references(() => shifts.id),
+  userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  type: text("type", { enum: ["entrada", "salida"] }).notNull(),
+  amount: real("amount").notNull(),
+  currency: text("currency").notNull().default("CUP"),
+  reason: text("reason"),
+  status: text("status", { enum: ["pendiente", "aprobada", "rechazada"] }).notNull().default("pendiente"),
+  approvedById: text("approved_by_id").references(() => users.id),
+  approvedAt: integer("approved_at", { mode: "timestamp" }),
+  decisionNote: text("decision_note"),
+  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+}, (table) => ({
+  pendingIdx: index("cash_movements_pending").on(table.companyId, table.locationId, table.status),
+  byShift: index("cash_movements_shift").on(table.companyId, table.shiftId, table.createdAt),
+}));
+
+// La explicación de un descuadre: cuánto y por qué.
+export const closingExplanations = sqliteTable("closing_explanations", {
+  id: text("id").primaryKey(),
+  companyId: text("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
+  closingId: text("closing_id").notNull().references(() => cashClosings.id, { onDelete: "cascade" }),
+  currency: text("currency").notNull(),
+  // El signo dice el sentido: negativo = faltante, positivo = sobrante.
+  amount: real("amount").notNull(),
+  note: text("note"),
+  createdById: text("created_by_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+}, (table) => ({
+  byClosing: index("closing_explanations_by_closing").on(table.closingId, table.currency),
+}));
 
 export const auditLogs = sqliteTable("audit_logs", {
   id: text("id").primaryKey(),

@@ -8,12 +8,16 @@ import { generateUUID } from "../lib/jwt";
 import { logAudit, getClientIp } from "../lib/audit";
 import { notify, adminsOf } from "../lib/push";
 import { resolveOwnLocation, getLocationStockQty, getActiveCompanyLocation } from "../lib/locations";
+import { conciliar, dinero, estadoExplicaciones, venceProvisional, VENTANA_PROVISIONAL_HORAS } from "../lib/cierreDinero";
 import {
   auditStmt,
   runBatch,
   errorMessage,
   ensureLocationStockStmt,
-  setStockStmt,
+  // El conteo ajusta por diferencia, no sobrescribiendo el stock: por eso
+  // aquí no se usa setStockStmt (ver la nota en el bucle de ajustes).
+  incrementStockStmt,
+  decrementStockStmt,
   recomputeProductStockStmt,
   stockMovementStmt,
 } from "../lib/batch";
@@ -218,6 +222,22 @@ closing.get("/preview/:initialReadingId", requireModule("cierre"), async (c) => 
     }
   }
 
+  // ── El dinero, para que la pantalla muestre lo que DEBERÍA haber ──
+  // Con lo contado todavía en blanco: el preview no sabe qué va a contar el
+  // cajero, solo cuánto hay y de dónde viene.
+  const turnoPreview = await db.select().from(schema.shifts)
+    .where(and(
+      eq(schema.shifts.companyId, auth.companyId),
+      eq(schema.shifts.locationId, initialReading.locationId!),
+      eq(schema.shifts.openingReadingId, initialReading.id),
+    )).get();
+  const dineroPreview = await conciliar(db, auth.companyId, initialReading.locationId!, {
+    periodStart, periodEnd,
+    baseCash: dinero(turnoPreview?.baseCash),
+    countedCash: {},
+    shiftId: turnoPreview?.id ?? null,
+  });
+
   return c.json({
     ok: true,
     data: {
@@ -229,6 +249,17 @@ closing.get("/preview/:initialReadingId", requireModule("cierre"), async (c) => 
       incomeEfectivo: parseFloat(incomeEfectivo.toFixed(2)),
       incomeTransferencia: parseFloat(incomeTransferencia.toFixed(2)),
       items: resultItems,
+      // El dinero va aparte de los productos: se cuenta en la caja, no se
+      // calcula con el catálogo. Y por moneda, nunca sumado.
+      cash: {
+        base: dineroPreview.base,
+        ventas: dineroPreview.ventas,
+        entradas: dineroPreview.entradas,
+        salidas: dineroPreview.salidas,
+        esperado: dineroPreview.esperado,
+      },
+      shiftId: turnoPreview?.id ?? null,
+      baseCash: dinero(turnoPreview?.baseCash),
     },
   });
 });
@@ -239,7 +270,14 @@ closing.get("/preview/:initialReadingId", requireModule("cierre"), async (c) => 
 closing.post("/confirm", requireModule("cierre"), async (c) => {
   const db = drizzle(c.env.DB, { schema });
   const auth = c.get("auth");
-  const body = await c.req.json<{ initialReadingId: string; items: any[]; notes?: string }>().catch(() => null);
+  const body = await c.req.json<{
+    initialReadingId: string; items: any[]; notes?: string;
+    /** Lo que el cajero contó de dinero, por moneda: {"CUP":1200,"USD":20} */
+    countedCash?: Record<string, number>;
+    /** La HORA del conteo. Sin conexión puede ser horas anterior a cuando se
+     *  sube, y de eso depende la ventana para explicar el descuadre. */
+    countedAt?: string;
+  }>().catch(() => null);
   if (!body?.initialReadingId) return c.json({ ok: false, error: "initialReadingId es requerido" }, 400);
 
   const initialReading = await loadInitialReading(db, auth, body.initialReadingId);
@@ -378,6 +416,44 @@ closing.post("/confirm", requireModule("cierre"), async (c) => {
       qty: i.stockValidated,
     }));
 
+  // ── El dinero ───────────────────────────────────────────────────────────
+  // El turno es el que sabe con cuánto dinero empezó la caja. Si no hay turno
+  // (un cierre viejo, o un admin cerrando sin haber abierto turno) se usa el
+  // fondo de la lectura de apertura, que es lo mejor que hay.
+  const turnoCierre = await db.select().from(schema.shifts)
+    .where(and(
+      eq(schema.shifts.companyId, auth.companyId),
+      eq(schema.shifts.locationId, locationId),
+      eq(schema.shifts.openingReadingId, initialReading.id),
+    )).get();
+  const shiftId = turnoCierre?.id ?? null;
+  const baseCash = dinero(turnoCierre?.baseCash);
+  const countedCash = dinero(body.countedCash);
+
+  // La hora del conteo la pone el cajero, no el servidor: si contó a las 8 y
+  // subió el cierre al día siguiente por falta de internet, la ventana de 20
+  // horas corre desde las 8. Si no se puede leer, se usa la del periodo.
+  const countedAt = body.countedAt && Number.isFinite(Date.parse(body.countedAt))
+    ? new Date(body.countedAt)
+    : new Date();
+
+  // Si no llega dinero contado, NO se calcula el descuadre. Hay dos caminos
+  // que llegan aquí sin dinero: un cliente viejo que no conoce esta pantalla,
+  // y un cierre encolado sin conexión desde antes de que existiera. Comparar
+  // "lo contado = 0" contra 17 500 de esperado daría un faltante enorme y
+  // FALSO, y dejaría el cierre provisional esperando una explicación
+  // que nadie puede dar porque nunca contó nada. Es mucho más honesto no
+  // reconciliar el dinero que inventar un descuadre.
+  const hayDineroContado = Object.keys(countedCash).length > 0;
+  const conciliacion = hayDineroContado
+    ? await conciliar(db, auth.companyId, locationId, {
+        periodStart, periodEnd, baseCash, countedCash, shiftId,
+      })
+    : {
+        base: baseCash, ventas: {}, entradas: {}, salidas: {},
+        esperado: {}, contado: {}, diff: {}, descuadra: false,
+      };
+
   const closingReadingId = generateUUID();
   const closingId = generateUUID();
   const totalSales = sales.length;
@@ -395,25 +471,37 @@ closing.post("/confirm", requireModule("cierre"), async (c) => {
       `INSERT INTO cash_closings (id, company_id, location_id, closed_by_id, initial_reading_id,
                                   closing_reading_id, confirm_key, period_start, period_end,
                                   total_sales, total_income, income_efectivo, income_transferencia,
-                                  items, notes, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())`
+                                  items, base_cash, counted_cash, expected_cash, cash_diff,
+                                  status, counted_at, provisional_until, shift_id,
+                                  notes, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
       closingId, auth.companyId, locationId, auth.userId, initialReading.id,
       closingReadingId, initialReading.id,
-      // OJO: D1 solo acepta number|string|boolean|null|ArrayBuffer en bind().
-      // Un Date lanzaría "Provided value cannot be bound..."; las columnas
-      // period_start/period_end son INTEGER en segundos (unixepoch), igual que
-      // created_at de las migraciones.
-      Math.floor(periodStart.getTime() / 1000), Math.floor(periodEnd.getTime() / 1000),
+      // period_start/period_end en MILISEGUNDOS: el esquema los declara
+      // { mode: "timestamp" }, que lee milisegundos. Antes se guardaban en
+      // segundos (unixepoch) y todo cierre histórico salía fechado en 1970.
+      // La migración 0013 repara los que ya estaban mal.
+      periodStart.getTime(), periodEnd.getTime(),
       totalSales, totalIncomeR, incomeEfectivoR, incomeTransferenciaR,
-      JSON.stringify(closingItems), (body.notes || "").trim() || null
+      JSON.stringify(closingItems),
+      JSON.stringify(conciliacion.base), JSON.stringify(conciliacion.contado),
+      JSON.stringify(conciliacion.esperado), JSON.stringify(conciliacion.diff),
+      // Si el dinero no cuadra, el cierre queda PROVISIONAL: existe, no se
+      // pierde, pero espera una explicación. Si cuadra, se cierra de una vez.
+      conciliacion.descuadra ? "provisional" : "cerrado",
+      countedAt.getTime(),
+      conciliacion.descuadra ? venceProvisional(countedAt, new Date()).getTime() : null,
+      shiftId,
+      (body.notes || "").trim() || null,
+      Date.now()
     ),
     c.env.DB.prepare(
       `INSERT INTO inventory_readings (id, company_id, location_id, taken_by_id, type, notes, items, created_at)
-       VALUES (?, ?, ?, ?, 'cierre', ?, ?, unixepoch())`
+       VALUES (?, ?, ?, ?, 'cierre', ?, ?, ?)`
     ).bind(
       closingReadingId, auth.companyId, locationId, auth.userId,
-      "Generada automaticamente al cierre", JSON.stringify(closingReadingItems)
+      "Generada automaticamente al cierre", JSON.stringify(closingReadingItems), Date.now()
     ),
   ];
 
@@ -422,9 +510,20 @@ closing.post("/confirm", requireModule("cierre"), async (c) => {
     const current = await getLocationStockQty(db, locationId, item.productId);
     const delta = validatedMap[item.productId] - current;
     if (Math.abs(delta) < 0.0005) continue;
+    // OJO: aquí se aplicaba setStockStmt, que ESCRIBE el stock con la cantidad
+    // contada. Eso parte de la foto del conteo, y en cuanto llegara una venta
+    // de ese periodo (una venta offline que sube tarde, un traspaso) esa venta
+    // descontaría de un stock que ya no era el real, y el inventario quedaría
+    // corrupto para siempre sin que nada lo delatara.
+    //
+    // Ahora el conteo es un MOVIMIENTO en el libro: se suma o se resta la
+    // diferencia sobre el stock de este instante. Una venta que llegue después
+    // descuenta de verdad, y los dos hechos son ciertos.
     stmts.push(
       ensureLocationStockStmt(c.env.DB, locationId, item.productId),
-      setStockStmt(c.env.DB, locationId, item.productId, validatedMap[item.productId]),
+      delta > 0
+        ? incrementStockStmt(c.env.DB, locationId, item.productId, delta)
+        : decrementStockStmt(c.env.DB, locationId, item.productId, -delta),
       stockMovementStmt(c.env.DB, {
         companyId: auth.companyId,
         productId: item.productId,
@@ -504,6 +603,10 @@ closing.post("/confirm", requireModule("cierre"), async (c) => {
 closing.get("/", requireModule("cierre"), async (c) => {
   const db = drizzle(c.env.DB, { schema });
   const auth = c.get("auth");
+  // Antes de mostrar la lista, se cierran los provisionales que ya vencieron:
+  // si no, la pantalla diría "provisional" de algo que en realidad ya cerró,
+  // y el dueño vería un descuadre_old sin resolver que ya tiene notificación.
+  await cerrarProvisionalesVencidos(db, c.env, auth.companyId);
   const { locationId } = c.req.query();
   const visibleIds = await resolveVisibleLocationIds(db, auth, locationId);
   if (visibleIds.length === 0) return c.json({ ok: true, data: [] });
@@ -533,3 +636,152 @@ closing.get("/:id", requireModule("cierre"), async (c) => {
 });
 
 export default closing;
+
+// ─── EXPLICAR UN DESCUADRE ──────────────────────────────────────────────────
+//
+// Un cierre provisional no está mal: está esperando que alguien diga cuánto
+// faltaba y por qué. Eso puede ser un cobro mal hecho, un cambio que se le
+// olvidó a alguien, un producto perdido. Y también puede ser un robo, que es
+// justo lo que el dueño tiene que poder ver.
+//
+// La regla acordada: la explicación tiene que coincidir con la cantidad EXACTA
+// del descuadre para resolverlo. Una explicación de 300 no resuelve un faltante
+// de 297, aunque se parezca. Se acepta lo que cuadra al peso, porque un cierre
+// de caja sirve justamente para que las cuentas cuadren.
+closing.post("/:id/explain", requireModule("cierre"), async (c) => {
+  const db = drizzle(c.env.DB, { schema });
+  const auth = c.get("auth");
+  const id = c.req.param("id");
+  const body = await c.req.json<{ currency?: string; amount?: number; note?: string }>().catch(() => null);
+
+  const closing = await db.select().from(schema.cashClosings)
+    .where(and(eq(schema.cashClosings.id, id), eq(schema.cashClosings.companyId, auth.companyId))).get();
+  if (!closing) return c.json({ ok: false, error: "Cierre no encontrado" }, 404);
+
+  if (!(await canAccessLocationId(db, auth, closing.locationId))) {
+    return c.json({ ok: false, error: "No tienes acceso a esa caja" }, 403);
+  }
+  if (closing.status !== "provisional") {
+    return c.json({ ok: false, error: "Ese cierre ya no está esperando explicaciones" }, 409);
+  }
+
+  const diff = dinero(closing.cashDiff);
+  const currency = (body?.currency || "").toUpperCase().slice(0, 8);
+  const amount = Number(body?.amount);
+  if (!currency || !Number.isFinite(amount) || amount === 0) {
+    return c.json({ ok: false, error: "Indica la moneda y la cantidad" }, 400);
+  }
+  // La moneda tiene que ser una de las que realmente descuadran: explicar el
+  // CUP de un cierre que solo descuadra en USD es un error de dedo que
+  // quedaría guardado para siempre en el historial.
+  if (!(currency in diff)) {
+    return c.json({ ok: false, error: `Ese cierre no descuadra en ${currency}` }, 400);
+  }
+  if (Math.abs(Math.abs(amount) - Math.abs(diff[currency])) > 0.005) {
+    return c.json({
+      ok: false,
+      error: `La diferencia es de ${Math.abs(diff[currency])} ${currency}. La explicación tiene que coincidir exactamente.`,
+      code: "AMOUNT_MISMATCH",
+    }, 400);
+  }
+  const nota = (body?.note || "").trim();
+  if (!nota) return c.json({ ok: false, error: "Escribe qué pasó" }, 400);
+
+  const explicacionId = generateUUID();
+  const stmts: D1PreparedStatement[] = [
+    db.insert(schema.closingExplanations).values({
+      id: explicacionId, companyId: auth.companyId, closingId: id,
+      currency, amount: Math.abs(amount), note: nota, createdById: auth.userId,
+    }).run() as unknown as D1PreparedStatement,
+  ];
+  await c.env.DB.batch(stmts);
+
+  // ¿Con esto ya cuadró todo? El cierre solo se resuelve si TODAS las monedas
+  // están explicadas: un cierre a medio explicar no es un cierre.
+  //
+  // La moneda recién explicada sale del descuadre ANTES de preguntar por las
+  // demás. Si se preguntara por ella con el descuadre ya en cero, seguiría
+  // apareciendo como pendiente y el cierre nunca se resolvería.
+  const diffRestante: Record<string, number> = { ...diff };
+  delete diffRestante[currency];
+  const estado = await estadoExplicaciones(db, id, diffRestante);
+  const quedan = estado.pendientes;
+  const nuevoStatus = quedan.length === 0 ? "resuelto" : "provisional";
+
+  await db.update(schema.cashClosings)
+    .set({ status: nuevoStatus, provisionalUntil: quedan.length === 0 ? null : closing.provisionalUntil })
+    .where(eq(schema.cashClosings.id, id));
+
+  await logAudit(c.env, {
+    companyId: auth.companyId, userId: auth.userId,
+    action: "closing.explain", entity: "cash_closing", entityId: id,
+    detail: { currency, amount: Math.abs(amount), note: nota, quedan }, ip: getClientIp(c),
+  });
+
+  // Si con esto se resolvió todo, el dueño tiene que enterarse de que ya
+  // está claro. Un aviso que solo dice "hubo un problema" y nunca dice "se
+  // resolvió" hace que la gente deje de mirar los avisos.
+  if (nuevoStatus === "resuelto") {
+    const paraAdmins = await adminsOf(db, auth.companyId);
+    if (paraAdmins.length) {
+      const loc = await getActiveCompanyLocation(db, auth.companyId, closing.locationId);
+      void notify({
+        env: c.env, db, companyId: auth.companyId, userIds: paraAdmins,
+        type: "closing.resolved",
+        title: "Cierre de caja resuelto",
+        body: `Se explicó el descuadre de ${loc?.name || "la caja"} y el cierre quedó cuadrado.`,
+        link: "/cierre",
+        data: { closingId: id, kind: "closing.resolved" },
+        waitUntil: (p) => c.executionCtx.waitUntil(p),
+      });
+    }
+  }
+
+  return c.json({ ok: true, data: { id: explicacionId, status: nuevoStatus, quedan } }, 201);
+});
+
+/**
+ * Cierra los provisionales que ya vencieron.
+ *
+ * Se llama en dos sitios: cuando alguien mira la lista de cierres (así el
+ * número que ve siempre es real) y desde el cron diario (para que el aviso
+ * salga aunque nadie abra la aplicación en 20 horas).
+ */
+export async function cerrarProvisionalesVencidos(db: any, env: Env, companyId?: string) {
+  const ahora = Date.now();
+  const vencidos = await db.select().from(schema.cashClosings)
+    .where(and(
+      ...(companyId ? [eq(schema.cashClosings.companyId, companyId)] : []),
+      eq(schema.cashClosings.status, "provisional"),
+    )).all()
+    .then((rows: any[]) => rows.filter((r: any) => r.provisionalUntil && new Date(r.provisionalUntil).getTime() <= ahora));
+
+  for (const c of vencidos) {
+    const diff = dinero(c.cashDiff);
+    await db.update(schema.cashClosings)
+      .set({ status: "cerrado", provisionalUntil: null })
+      .where(eq(schema.cashClosings.id, c.id));
+    await db.insert(schema.auditLogs).values({
+      id: generateUUID(), companyId: c.companyId, userId: null,
+      action: "closing.provisional_expired", entity: "cash_closing", entityId: c.id,
+      detail: { diff, ventanaHoras: VENTANA_PROVISIONAL_HORAS },
+      createdAt: new Date(),
+    }).run();
+    const admins = await adminsOf(db, c.companyId);
+    if (admins.length) {
+      const loc = await getActiveCompanyLocation(db, c.companyId, c.locationId);
+      const detalle = Object.entries(diff)
+        .map(([k, v]) => `${Math.abs(v)} ${k}${v < 0 ? " faltante" : " sobrante"}`)
+        .join(", ");
+      void notify({
+        env, db, companyId: c.companyId, userIds: admins,
+        type: "closing.expired",
+        title: "Cierre de caja sin explicación",
+        body: `En ${loc?.name || "la caja"} pasó ${VENTANA_PROVISIONAL_HORAS} horas sin explicarse: ${detalle || "descuadre de dinero"}.`,
+        link: "/cierre",
+        data: { closingId: c.id, kind: "closing.expired" },
+      });
+    }
+  }
+  return vencidos.length;
+}

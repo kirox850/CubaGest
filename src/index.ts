@@ -1,4 +1,6 @@
 import { Hono } from "hono";
+import { drizzle } from "drizzle-orm/d1";
+import * as schema from "./db/schema";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import auth from "./routes/auth";
@@ -20,6 +22,8 @@ import platform from "./routes/platform";
 import referrals from "./routes/referrals";
 import push from "./routes/push";
 import shifts from "./routes/shifts";
+import cashMovements from "./routes/cashMovements";
+import { cerrarProvisionalesVencidos } from "./routes/closing";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -54,6 +58,7 @@ app.route("/platform", platform);
 app.route("/referrals", referrals);
 app.route("/push", push);
 app.route("/shift", shifts);
+app.route("/cash-movements", cashMovements);
 
 app.onError((err, c) => {
   console.error(err);
@@ -73,5 +78,13 @@ export default {
     // tardar hasta ~100 s por el ritmo de QvaPay, así que encadenarlas
     // detrás añadiría esa espera a un trabajo que debería ser instantáneo.
     ctx.waitUntil(sweepPaymentAuthorizations(env));
+    // Los cierres provisionales que pasaron su ventana sin explicación se
+    // cierran solos, aunque nadie abra la aplicación: el aviso tiene que salir
+    // a las 20 horas, no cuando el dueño se acuerde de mirar.
+    ctx.waitUntil((async () => {
+      const db = drizzle(env.DB, { schema });
+      const n = await cerrarProvisionalesVencidos(db, env);
+      if (n) console.log(`cerrados ${n} cierre(s) provisional(es) vencido(s)`);
+    })());
   },
 };

@@ -543,7 +543,69 @@ console.log("\n13) Cajas compartidas y turnos");
     && !/raspado/.test(curVisible) && !/wrangler/.test(curVisible));
 }
 
-console.log("\n14) El proxy del frontend reenvía la IP real");
+console.log("\n14) El diseño de cierres: dinero, movimientos y provisional");
+{
+  const R = (p) => readFileSync(new URL(p, import.meta.url), "utf8");
+  const m13 = R("../migrations/0013_closing_design.sql");
+  const din = R("../src/lib/cierreDinero.ts");
+  const clo = R("../src/routes/closing.ts");
+  const mov = R("../src/routes/cashMovements.ts");
+  const idx = R("../src/index.ts");
+  const cc  = R("../../CubaGest-Web/src/screens/CierreCaja.tsx");
+  const dc  = R("../../CubaGest-Web/src/components/shared/DineroCierre.tsx");
+
+  check("el período de los cierres viejos se arregla (se guardaba en segundos)",
+    /period_start = period_start \* 1000/.test(m13) && /periodStart\.getTime\(\), periodEnd\.getTime\(\)/.test(clo));
+  const cloCodigo = clo.replace(/\/\/.*$/gm, "").replace(/\*\*[\s\S]*?\*\//g, "");
+  check("el conteo ya no pisa el stock: ajusta por diferencia",
+    !/setStockStmt/.test(cloCodigo) && /incrementStockStmt/.test(cloCodigo) && /decrementStockStmt/.test(cloCodigo));
+  check("una venta que llega tarde ya no descuadra el inventario para siempre",
+    /una venta que llegue después/i.test(clo));
+
+  // El dinero, por moneda. Esto es el núcleo del diseño.
+  check("cada moneda se lleva por su cuenta, nunca sumando entre ellas",
+    /const monedas = new Set/.test(din) && /delete diffRestante\[currency\]/.test(clo));
+  check("solo entran las ventas EN EFECTIVO (una transferencia no pasa por la caja)",
+    /payMethod !== "efectivo"/.test(din) && /continue/.test(din));
+  check("las salidas pendientes de aprobación no cuentan todavía",
+    /eq\(schema\.cashMovements\.status, "aprobada"\)/.test(din));
+  check("una salida sin motivo no se registra (es el caso que todo esto arregla)",
+    /if \(type === "salida" && !motivo\)/.test(mov) && /Sin motivo no se puede registrar/.test(mov));
+  check("un cajero sin turno abierto no registra salidas",
+    /Abre tu turno antes de registrar una salida/.test(mov));
+  check("nadie aprueba su propio movimiento",
+    /No puedes aprobar un movimiento que registraste tú mismo/.test(mov));
+
+  // La explicación tiene que ser EXACTA. Aceptar importes aproximados dejaría
+  // que cualquier descuadre se cerrara con un número redondo.
+  check("la explicación debe coincidir exacto con el descuadre",
+    /explicaExactamente/.test(din) && /AMOUNT_MISMATCH/.test(clo) && /coincidir exactamente/.test(dc));
+  check("una explicación que no cuadra se muestra como pista, pero no resuelve",
+    /te faltó esto por poco/.test(din) && /if \(!exactas\[k\] \|\| exactas\[k\]\.length === 0\)/.test(din));
+  check("el cierre solo se resuelve si TODAS las monedas están explicadas",
+    /nuevoStatus = quedan\.length === 0 \? "resuelto" : "provisional"/.test(clo));
+  check("y la moneda recién explicada sale del descuadre antes de preguntar",
+    /delete diffRestante\[currency\]/.test(clo));
+
+  // La ventana de 20 horas corre desde el CONTEO, no desde la sincronización.
+  check("la ventana corre desde la hora del conteo, no de la subida",
+    /VENTANA_PROVISIONAL_HORAS = 20/.test(din) && /body\.countedAt/.test(clo) && /countedAt\.getTime\(\)/.test(clo));
+  check("y sin conexión el móvil manda esa hora de verdad",
+    /countedAt: new Date\(c\.timestamp\)\.toISOString\(\)/.test(R("../../CubaGest-Web/src/App.tsx")));
+  check("los provisionales vencidos se cierran solos, aunque nadie mire la app",
+    /cerrarProvisionalesVencidos/.test(clo) && /cerrarProvisionalesVencidos/.test(idx));
+  check("y se avisa de los que quedan sin explicar",
+    /closing\.expired/.test(clo));
+  check("un cliente viejo que no manda dinero NO genera un descuadre inventado",
+    /hayDineroContado/.test(clo) && /comparar\n\s*\"lo contado = 0\"/.test(clo) === false && /descuadre\n\s*\*\*FALSO/.test(clo) === false);
+  check("es decir: sin dinero contado, no se reconcilia (mejor callar que mentir)",
+    /descuadra: false/.test(clo));
+
+  check("la lista de cierres refleja lo vencido, no dice 'provisional' de algo ya cerrado",
+    /await cerrarProvisionalesVencidos\(db, c\.env, auth\.companyId\)/.test(clo));
+}
+
+console.log("\n15) El proxy del frontend reenvía la IP real");
 const proxySrc = readFileSync(new URL("../../CubaGest-Web/functions/api/[[path]].ts", import.meta.url), "utf8");
 check("functions/api/[[path]].ts reenvía cf-connecting-ip", /headers\.set\("cf-connecting-ip"/.test(proxySrc));
 check("el proxy corta si el backend se cuelga (AbortController)",

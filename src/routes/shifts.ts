@@ -9,6 +9,7 @@ import { generateUUID } from "../lib/jwt";
 import {
   getCajasAsignadas, getOpenShiftForUser, getOpenShiftForLocation, getActiveCompanyLocation,
 } from "../lib/locations";
+import { dinero } from "../lib/cierreDinero";
 
 // ─── TURNOS ──────────────────────────────────────────────────────────────────
 //
@@ -44,6 +45,7 @@ shifts.get("/current", requireAnyModule("pos", "cierre", "inventario", "facturac
         locationName: turno.location.name,
         startedAt: turno.startedAt,
         openingReadingId: turno.openingReadingId,
+        baseCash: dinero(turno.baseCash),
       },
       assignedCajas: auth.role === "cajero" ? await getCajasAsignadas(db, auth.companyId, auth.userId) : [],
     },
@@ -54,9 +56,13 @@ shifts.get("/current", requireAnyModule("pos", "cierre", "inventario", "facturac
 shifts.post("/start", requireModule("pos"), async (c) => {
   const db = drizzle(c.env.DB, { schema });
   const auth = c.get("auth");
-  const body = await c.req.json<{ locationId?: string }>();
+  const body = await c.req.json<{ locationId?: string; baseCash?: Record<string, number> }>();
   const locationId = body.locationId;
   if (!locationId) return c.json({ ok: false, error: "Elige una caja para trabajar" }, 400);
+
+  // Con cuánto dinero arranca la caja. Sin esto el cierre no tiene contra qué
+  // comparar: un faltante de 200 no dice si es de este turno o venía de antes.
+  const baseCash = dinero(body.baseCash || {});
 
   // El admin no necesita asignación: puede abrir turno en cualquier caja de su
   // empresa. Un cajero, solo en las que le hayan asignado.
@@ -107,7 +113,7 @@ shifts.post("/start", requireModule("pos"), async (c) => {
   const stmts: D1PreparedStatement[] = [];
   stmts.push(db.insert(schema.shifts).values({
     id: shiftId, companyId: auth.companyId, locationId: location.id, userId: auth.userId,
-    status: "abierto", openingReadingId: readingId,
+    status: "abierto", openingReadingId: readingId, baseCash,
   }).run() as unknown as D1PreparedStatement);
   stmts.push(db.insert(schema.inventoryReadings).values({
     id: readingId, companyId: auth.companyId, locationId: location.id, takenById: auth.userId,
@@ -124,7 +130,7 @@ shifts.post("/start", requireModule("pos"), async (c) => {
   return c.json({
     ok: true,
     data: {
-      shift: { id: shiftId, locationId: location.id, locationName: location.name, startedAt: new Date(), openingReadingId: readingId },
+      shift: { id: shiftId, locationId: location.id, locationName: location.name, startedAt: new Date(), openingReadingId: readingId, baseCash },
     },
   }, 201);
 });
