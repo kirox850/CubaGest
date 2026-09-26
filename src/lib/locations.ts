@@ -82,6 +82,35 @@ export async function getCajaLocationForUser(db: DB, companyId: string, userId: 
     .get();
 }
 
+/**
+ * Las cajas que puede abrir ESTE usuario.
+ *
+ * Antes esto era "la caja cuyo ownerUserId es su id": un cajero, una caja. Con
+ * las cajas compartidas ya no sirve: un cajero puede tener varias asignadas y
+ * una caja la pueden llevar varios. Ahora sale de la tabla de asignaciones.
+ * El almacén no se asigna: es de la empresa.
+ */
+export async function getCajasAsignadas(db: DB, companyId: string, userId: string) {
+  const rows = await db.select({ id: schema.inventoryLocations.id, name: schema.inventoryLocations.name, type: schema.inventoryLocations.type, active: schema.inventoryLocations.active })
+    .from(schema.locationAssignments)
+    .innerJoin(schema.inventoryLocations, eq(schema.locationAssignments.locationId, schema.inventoryLocations.id))
+    .where(and(
+      eq(schema.locationAssignments.companyId, companyId),
+      eq(schema.locationAssignments.userId, userId),
+    )).all();
+  return rows.filter((r) => r.type === "caja" && r.active);
+}
+
+/** Cajas que un admin puede asignar a alguien (cajas activas, sin almacén). */
+export async function getAssignableCajas(db: DB, companyId: string) {
+  return db.select({ id: schema.inventoryLocations.id, name: schema.inventoryLocations.name, active: schema.inventoryLocations.active })
+    .from(schema.inventoryLocations)
+    .where(and(
+      eq(schema.inventoryLocations.companyId, companyId),
+      eq(schema.inventoryLocations.type, "caja"),
+    )).all();
+}
+
 // "Mi propia ubicación" según el rol de quien hace la petición.
 // admin NO tiene una ubicación propia fija — para acciones sobre una
 // ubicación concreta, el admin debe indicarla explícitamente (locationId
@@ -89,10 +118,41 @@ export async function getCajaLocationForUser(db: DB, companyId: string, userId: 
 export async function resolveOwnLocation(db: DB, auth: AuthContext) {
   if (auth.role === "almacenista") return getActiveAlmacenLocation(db, auth.companyId);
   if (auth.role === "cajero") {
-    const caja = await getCajaLocationForUser(db, auth.companyId, auth.userId);
-    return caja && caja.active ? caja : null;
+    // El turno abierto es lo que manda: si está trabajando en la caja 2, la
+    // caja 1 que también tiene asignada no es "la suya" ahora mismo.
+    const turno = await getOpenShiftForUser(db, auth.companyId, auth.userId);
+    if (turno) return turno.location;
+    // Sin turno abierto: si solo le asignaron una caja, se usa sin preguntar
+    // (así un cajero con una única caja no ve un paso extra cada día). Con
+    // varias, tiene que abrir turno y elegir — que es justo lo que se busca.
+    const asignadas = await getCajasAsignadas(db, auth.companyId, auth.userId);
+    return asignadas.length === 1 ? await getActiveCompanyLocation(db, auth.companyId, asignadas[0].id) : null;
   }
   return null;
+}
+
+/** El turno abierto de este usuario, con la caja en la que está. */
+export async function getOpenShiftForUser(db: DB, companyId: string, userId: string) {
+  const row = await db.select().from(schema.shifts)
+    .where(and(
+      eq(schema.shifts.companyId, companyId),
+      eq(schema.shifts.userId, userId),
+      eq(schema.shifts.status, "abierto"),
+    )).get();
+  if (!row) return null;
+  const location = await getActiveCompanyLocation(db, companyId, row.locationId);
+  if (!location) return null;   // la caja se desactivó con el turno abierto
+  return { ...row, location };
+}
+
+/** El turno abierto de ESTA caja, si lo hay. Nadie más puede abrirla mientras tanto. */
+export async function getOpenShiftForLocation(db: DB, companyId: string, locationId: string) {
+  return db.select().from(schema.shifts)
+    .where(and(
+      eq(schema.shifts.companyId, companyId),
+      eq(schema.shifts.locationId, locationId),
+      eq(schema.shifts.status, "abierto"),
+    )).get();
 }
 
 // Crea la caja de un cajero si todavía no la tiene (usuario nuevo, o un

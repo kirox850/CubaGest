@@ -147,6 +147,38 @@ export const inventoryLocations = sqliteTable("inventory_locations", {
   ownerIdx: index("locations_owner_idx").on(table.ownerUserId),
 }));
 
+// Cajas compartidas entre cajeros. Muchos a muchos: un cajero puede tener
+// varias cajas, y una caja la pueden llevar varios cheiros en días distintos.
+export const locationAssignments = sqliteTable("location_assignments", {
+  id: text("id").primaryKey(),
+  companyId: text("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
+  userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  locationId: text("location_id").notNull().references(() => inventoryLocations.id, { onDelete: "cascade" }),
+  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+}, (table) => ({
+  uniq: uniqueIndex("location_assignments_uniq").on(table.companyId, table.userId, table.locationId),
+  byUser: index("location_assignments_user").on(table.companyId, table.userId),
+  byLocation: index("location_assignments_location").on(table.companyId, table.locationId),
+}));
+
+// Turno de trabajo: "esta persona, en esta caja, desde esta hora". El cajero
+// elige la caja al abrirlo, y al cerrarlo nace el cierre de caja.
+export const shifts = sqliteTable("shifts", {
+  id: text("id").primaryKey(),
+  companyId: text("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
+  locationId: text("location_id").notNull().references(() => inventoryLocations.id, { onDelete: "cascade" }),
+  userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  startedAt: integer("started_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
+  endedAt: integer("ended_at", { mode: "timestamp" }),
+  status: text("status", { enum: ["abierto", "cerrado"] }).notNull().default("abierto"),
+  openingReadingId: text("opening_reading_id").references(() => inventoryReadings.id),
+  notes: text("notes"),
+  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+}, (table) => ({
+  byUser: index("shifts_open").on(table.companyId, table.userId, table.status),
+  byLocation: index("shifts_location").on(table.companyId, table.locationId, table.startedAt),
+}));
+
 export const locationStock = sqliteTable("location_stock", {
   id: text("id").primaryKey(),
   locationId: text("location_id").notNull().references(() => inventoryLocations.id, { onDelete: "cascade" }),

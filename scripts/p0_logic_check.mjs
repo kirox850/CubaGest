@@ -401,8 +401,12 @@ console.log("\n10) Modo sin conexión: lo que se rompió al probarlo en un telé
     /caches\.match\('\/index\.html'\)/.test(swOffline) && /req\.mode === 'navigate'/.test(swOffline));
   check("pero nunca cachea datos de /api (se filtrarían entre usuarios)",
     /if \(isApiPath\(url\.pathname\)\) return;/.test(swOffline));
+  // Comprobación monótona: si el número de la caché está escrito a mano, un
+  // check con la versión fija falla justo cuando se sube (que es cuando debe
+  // pasar), y no avisa si alguien la baja.
+  const vCache = Number((swOffline.match(/const CACHE = 'cubagest-v(\d+)'/) || [])[1] || 0);
   check("la versión del caché sube para que el móvil tome la app nueva",
-    /const CACHE = 'cubagest-v8'/.test(swOffline));
+    vCache >= 9, ` (está en v${vCache}; se necesita v9 o superior)`);
 }
 
 console.log("\n11) Fechas de venta: la hora real, no la de llegada");
@@ -454,7 +458,7 @@ console.log("\n12) Configuración: todo en un sitio, y el margen es del negocio"
   check("el menú de perfil tiene UNA entrada de configuración, no cuatro",
     /Configuración/.test(app) && !/setCurrenciesOpen\(true\)/.test(app) && !/setDiscountsOpen\(true\)/.test(app));
   check("y las cuatro pantallas viven dentro, como pestañas laterales",
-    /type TabId = "caja" \| "monedas" \| "descuentos" \| "usuarios" \| "auditoria" \| "plan"/.test(conf));
+    /type TabId = "cajas" \| "caja" \| "monedas" \| "descuentos" \| "usuarios" \| "auditoria" \| "plan"/.test(conf));
   check("el paso a lateral se hace por CSS, no con estilos inline",
     /\.cfg-split \{ flex-direction:row; \}/.test(conf) && !/className="cfg-split" style=/.test(conf));
   check("nada de modales anidados (el de arriba tapaba al de abajo, sin vuelta atrás)",
@@ -481,7 +485,65 @@ console.log("\n12) Configuración: todo en un sitio, y el margen es del negocio"
     /cashRequireApproval/.test(sch) && /aprobación de un admin o un contador/.test(caja));
 }
 
-console.log("\n13) El proxy del frontend reenvía la IP real");
+console.log("\n13) Cajas compartidas y turnos");
+{
+  const R = (p) => readFileSync(new URL(p, import.meta.url), "utf8");
+  const m12 = R("../migrations/0012_cashier_locations_shifts.sql");
+  const lib = R("../src/lib/locations.ts");
+  const sh  = R("../src/routes/shifts.ts");
+  const usr = R("../src/routes/users.ts");
+  const pos = R("../../CubaGest-Web/src/screens/POS.tsx");
+  const cur = R("../../CubaGest-Web/src/screens/CurrenciesSettings.tsx");
+
+  check("las cajas ya no son de un cajero: hay tabla de asignación",
+    /CREATE TABLE IF NOT EXISTS location_assignments/.test(m12));
+  check("las cajas que ya existían se asignan solas, para no dejar a nadie sin caja",
+    /INSERT OR IGNORE INTO location_assignments/.test(m12) && /owner_user_id IS NOT NULL/.test(m12));
+  check("varias cajas pueden turnar sobre la misma caja (y eso es a propósito)",
+    /varios cajeros/.test(m12) && !/location_assignments_caja_unica/.test(m12));
+
+  // Lo que de verdad protege el inventario no es la asignación, sino los turnos.
+  check("una caja no puede tener dos turnos abiertos a la vez",
+    /shifts_one_open_per_location/.test(m12) && /esa caja ya est/gi);
+  check("un cajero no puede tener dos turnos abiertos a la vez",
+    /shifts_one_open_per_user/.test(m12));
+  check("abrir turno crea la lectura de apertura de ESA caja, en una sola transacción",
+    /openingReadingId: readingId/.test(sh) && /DB\.batch\(stmts\)/.test(sh));
+  check("el turno abierto manda sobre las cajas asignadas",
+    /getOpenShiftForUser/.test(lib) && /asignadas\.length === 1/.test(lib));
+
+  // El backend es quien decide: un cajero no puede abrir turno en una caja ajena.
+  check("un cajero solo abre turno en cajas que el admin le asignó",
+    /No tienes esa caja asignada/.test(sh) && /getCajasAsignadas/.test(sh));
+  check("asignar una caja de otra empresa no cuela",
+    /getActiveCompanyLocation\(db, auth\.companyId, id\)/.test(sh) && /location\.type !== "caja"/.test(sh));
+
+  // La baja de un cajero NO puede tocar el stock de una caja compartida.
+  check("dar de baja a un cajero NO vacía la caja compartida de los demás",
+    !/returnAllStockToAlmacen/.test(usr) && /assignments_cleared/.test(usr));
+  check("ni la desactiva (la caja es del negocio, no del empleado)",
+    !/active: false\)\)\.where\(eq\(schema\.inventoryLocations\.id, caja\.id\)\)/.test(usr));
+  check("y el cajero nuevo ya no recibe una caja propia",
+    !/ensureCajaLocation/.test(usr));
+
+  // El POS vende en la caja del turno, no en la "caja del dueño".
+  check("el POS toma la caja del turno, no la del dueño",
+    /locs\.find\(\(l:any\)=>l\.id===shift\.locationId\)/.test(pos));
+  check("sin turno abierto el POS no vende y lo dice",
+    /No tienes un turno abierto/.test(pos) && /Comenzar turno/.test(pos));
+  check("abrir turno recarga el catálogo de la caja nueva",
+    /\[online, shift\?\.id\]/.test(pos));
+
+  // Un cliente nunca debe ver notas de implementación.
+  // Sin comentarios: en el código el token SÍ se menciona (es donde se
+  // documenta), pero un cliente no lee el código, lo que importa es lo que ve.
+  const curVisible = cur.replace(/\/\/.*$/gm, "").replace(/\*\*[\s\S]*?\*\//g, "");
+  check("el texto técnico de elToque no está en la UI",
+    !/eltoque\.com\/docs/.test(curVisible) && !/ELTOQUE_API_TOKEN/.test(curVisible)
+    && !/raspado/.test(curVisible) && !/wrangler/.test(curVisible));
+}
+
+console.log("\n14) El proxy del frontend reenvía la IP real");
 const proxySrc = readFileSync(new URL("../../CubaGest-Web/functions/api/[[path]].ts", import.meta.url), "utf8");
 check("functions/api/[[path]].ts reenvía cf-connecting-ip", /headers\.set\("cf-connecting-ip"/.test(proxySrc));
 check("el proxy corta si el backend se cuelga (AbortController)",

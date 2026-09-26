@@ -7,7 +7,6 @@ import { requireModule, requireRole } from "../middleware/roles";
 import { checkLimit } from "../middleware/plans";
 import { generateUUID } from "../lib/jwt";
 import { logAudit, getClientIp } from "../lib/audit";
-import { ensureCajaLocation, getCajaLocationForUser, returnAllStockToAlmacen } from "../lib/locations";
 import { issuePasswordToken, PENDING_ACTIVATION } from "../lib/passwordTokens";
 
 const users = new Hono<{ Bindings: Env }>();
@@ -62,21 +61,9 @@ users.post("/", requireModule("usuarios"), checkLimit("users"), async (c) => {
     name, email, passwordHash: PENDING_ACTIVATION, role: role as any, nit: nit || null,
   }).returning().get();
 
-  // Un cajero nuevo tiene su propia caja/inventario desde el día uno, con
-  // una lectura de apertura vacía para poder hacer cierre sin depender de
-  // que un admin la tome manualmente primero.
-  if (role === "cajero") {
-    const location = await ensureCajaLocation(db, auth.companyId, user.id, user.name);
-    await db.insert(schema.inventoryReadings).values({
-      id: generateUUID(),
-      companyId: auth.companyId,
-      locationId: location.id,
-      takenById: auth.userId,
-      type: "apertura",
-      notes: "Lectura inicial automática (caja nueva)",
-      items: [],
-    });
-  }
+  // Ya NO se le crea una caja propia. Las cajas son del negocio y las asigna
+  // el admin (PUT /shift/assignments/:userId): así dos personas pueden
+  // trabajar el mismo mostrador sin duplicar el inventario.
 
   const { url, emailSent } = await issuePasswordToken(c.env, db, user, "set_password");
 
@@ -121,38 +108,26 @@ users.put("/:id", requireModule("usuarios"), async (c) => {
   // de nadie. Para ayudar a alguien a cambiarla, usa
   // POST /users/:id/resend-set-password, que manda un link nuevo.
 
-  // Si deja de ser cajero, su inventario vuelve al almacén automáticamente
-  // — no se queda "flotando" sin dueño operativo.
+  // Si deja de ser cajero, se le quitan las cajas ASIGNADAS — y solo eso.
+  //
+  // Antes, además, devolvía todo el stock de la caja al almacén y la
+  // desactivaba. Con cajas compartidas eso era peligroso: la caja es del
+  // negocio, y si tres cajeros trabajan el mismo mostrador, dar de baja a uno
+  // vaciaba el inventario que estaban usando los otros dos. El stock de una
+  // caja compartida no "pertenece" a nadie, así que no se toca: si queda
+  // mercancía en cajas sin nadie asignado, es decisión del admin, no un efecto
+  // secundario de dar de baja a un empleado.
   if (roleChanging && user.role === "cajero" && body.role !== "cajero") {
-    const caja = await getCajaLocationForUser(db, auth.companyId, user.id);
-    if (caja) {
-      const { itemsReturned } = await returnAllStockToAlmacen(db, c.env, auth.companyId, caja.id, auth.userId, `Cambio de rol de ${user.name} (${user.role} → ${body.role})`);
-      await db.update(schema.inventoryLocations).set({ active: false }).where(eq(schema.inventoryLocations.id, caja.id));
-      if (itemsReturned > 0) {
-        await logAudit(c.env, {
-          companyId: auth.companyId, userId: auth.userId,
-          action: "location.auto_return_stock", entity: "inventory_location", entityId: caja.id,
-          detail: { reason: "role_change", user: user.name, itemsReturned },
-          ip: getClientIp(c),
-        });
-      }
-    }
-  }
-  // Si ahora SÍ es cajero (y antes no lo era), se le crea su caja.
-  if (roleChanging && body.role === "cajero" && user.role !== "cajero") {
-    const location = await ensureCajaLocation(db, auth.companyId, user.id, body.name || user.name);
-    const hasReading = await db.select().from(schema.inventoryReadings)
-      .where(eq(schema.inventoryReadings.locationId, location.id)).get();
-    if (!hasReading) {
-      await db.insert(schema.inventoryReadings).values({
-        id: generateUUID(), companyId: auth.companyId, locationId: location.id, takenById: auth.userId,
-        type: "apertura", notes: "Lectura inicial automática (caja nueva)", items: [],
-      });
-    }
-  }
-  // Si se reactiva un cajero que ya tenía caja (estaba inactiva), reactivarla.
-  if (body.active === true && !user.active && (body.role || user.role) === "cajero") {
-    await ensureCajaLocation(db, auth.companyId, user.id, body.name || user.name);
+    await db.delete(schema.locationAssignments).where(and(
+      eq(schema.locationAssignments.companyId, auth.companyId),
+      eq(schema.locationAssignments.userId, user.id),
+    ));
+    await logAudit(c.env, {
+      companyId: auth.companyId, userId: auth.userId,
+      action: "location.assignments_cleared", entity: "user", entityId: user.id,
+      detail: { reason: "role_change", user: user.name, from: user.role, to: body.role },
+      ip: getClientIp(c),
+    });
   }
 
   await db.update(schema.users).set(updates).where(eq(schema.users.id, id));
@@ -182,22 +157,20 @@ users.delete("/:id", requireModule("usuarios"), requireRole("admin"), async (c) 
     .where(and(eq(schema.users.id, id), eq(schema.users.companyId, auth.companyId))).get();
   if (!user) return c.json({ ok: false, error: "Usuario no encontrado" }, 404);
 
-  // Si es cajero, todo su inventario se devuelve al almacén antes de
-  // desactivarlo — nunca queda stock "huérfano" en una caja inactiva.
+  // Mismo criterio que en el cambio de rol: se le quitan las cajas asignadas
+  // y NO se toca el stock ni se desactiva ninguna caja. Con cajas compartidas,
+  // vaciar "su" caja aquí Vaciaría la mercancía de los demás cajeros.
   if (user.role === "cajero") {
-    const caja = await getCajaLocationForUser(db, auth.companyId, user.id);
-    if (caja) {
-      const { itemsReturned } = await returnAllStockToAlmacen(db, c.env, auth.companyId, caja.id, auth.userId, `Baja de ${user.name}`);
-      await db.update(schema.inventoryLocations).set({ active: false }).where(eq(schema.inventoryLocations.id, caja.id));
-      if (itemsReturned > 0) {
-        await logAudit(c.env, {
-          companyId: auth.companyId, userId: auth.userId,
-          action: "location.auto_return_stock", entity: "inventory_location", entityId: caja.id,
-          detail: { reason: "user_deactivated", user: user.name, itemsReturned },
-          ip: getClientIp(c),
-        });
-      }
-    }
+    await db.delete(schema.locationAssignments).where(and(
+      eq(schema.locationAssignments.companyId, auth.companyId),
+      eq(schema.locationAssignments.userId, user.id),
+    ));
+    await logAudit(c.env, {
+      companyId: auth.companyId, userId: auth.userId,
+      action: "location.assignments_cleared", entity: "user", entityId: user.id,
+      detail: { reason: "user_deactivated", user: user.name },
+      ip: getClientIp(c),
+    });
   }
 
   await db.update(schema.users).set({ active: false }).where(eq(schema.users.id, id));

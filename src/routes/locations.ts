@@ -1,11 +1,16 @@
 import { Hono } from "hono";
 import { eq, and } from "drizzle-orm";
+import { generateUUID } from "../lib/jwt";
 import { drizzle } from "drizzle-orm/d1";
 import * as schema from "../db/schema";
 import { authMiddleware } from "../middleware/auth";
 import { requireAnyModule } from "../middleware/roles";
 import { logAudit, getClientIp } from "../lib/audit";
-import { adjustLocationStock, StockInsufficientError, getActiveCompanyLocation } from "../lib/locations";
+import {
+  adjustLocationStock, StockInsufficientError, getActiveCompanyLocation,
+  getCajasAsignadas, getAssignableCajas, getOpenShiftForUser,
+} from "../lib/locations";
+import { requireRole } from "../middleware/roles";
 import { stockMovementStmt, runBatch } from "../lib/batch";
 
 const locations = new Hono<{ Bindings: Env }>();
@@ -15,10 +20,23 @@ locations.use("*", authMiddleware);
 // Devuelve true si el usuario puede ver/operar la ubicación dada:
 // admin siempre (dentro de su empresa); almacenista solo el almacén; cajero
 // solo su propia caja. El contador no opera inventario: no entra.
-async function canAccessLocation(auth: { userId: string; role: string }, location: typeof schema.inventoryLocations.$inferSelect) {
+async function canAccessLocation(
+  db: ReturnType<typeof drizzle>,
+  auth: { userId: string; companyId: string; role: string },
+  location: typeof schema.inventoryLocations.$inferSelect,
+) {
   if (auth.role === "admin") return true;
   if (auth.role === "almacenista") return location.type === "almacen";
-  if (auth.role === "cajero") return location.type === "caja" && location.ownerUserId === auth.userId;
+  // Un cajero entra a una caja si tiene turno abierto en ella, o si se la
+  // asignaron (puede ver su stock aunque otro cajero esté trabajando ahora).
+  if (auth.role === "cajero") {
+    if (location.type !== "caja") return false;
+    if (location.ownerUserId === auth.userId) return true;   // cajas anteriores a este cambio
+    const abierta = await getOpenShiftForUser(db, auth.companyId, auth.userId);
+    if (abierta?.locationId === location.id) return true;
+    const asignadas = await getCajasAsignadas(db, auth.companyId, auth.userId);
+    return asignadas.some((a) => a.id === location.id);
+  }
   return false;
 }
 
@@ -31,7 +49,50 @@ locations.get("/", requireAnyModule("inventario", "pos", "facturacion", "cierre"
   const auth = c.get("auth");
   const rows = await db.select().from(schema.inventoryLocations)
     .where(eq(schema.inventoryLocations.companyId, auth.companyId)).all();
-  return c.json({ ok: true, data: rows });
+  const turno = auth.role === "cajero" ? await getOpenShiftForUser(db, auth.companyId, auth.userId) : null;
+  return c.json({ ok: true, data: rows, currentShift: turno ?? null, currentLocationId: turno?.locationId ?? null });
+});
+
+// POST /locations — el admin CREA las cajas. Antes las cajas nacían solas, una
+// por cajero, y por eso no había forma de tener dos personas en el mismo
+// mostrador sin duplicar el inventario.
+locations.post("/", requireAnyModule("inventario", "pos", "cierre", "transferencias"), requireRole("admin"), async (c) => {
+  const db = drizzle(c.env.DB, { schema });
+  const auth = c.get("auth");
+  const body = await c.req.json<{ name?: string; type?: "caja" | "almacen" }>();
+  const name = (body.name || "").trim();
+  if (!name) return c.json({ ok: false, error: "El nombre es obligatorio" }, 400);
+  const type = body.type === "almacen" ? "almacen" : "caja";
+
+  const repetida = await db.select().from(schema.inventoryLocations).where(and(
+    eq(schema.inventoryLocations.companyId, auth.companyId),
+    eq(schema.inventoryLocations.name, name),
+    eq(schema.inventoryLocations.type, type),
+  )).get();
+  if (repetida) return c.json({ ok: false, error: "Ya existe una ubicación con ese nombre" }, 409);
+
+  const location = await db.insert(schema.inventoryLocations).values({
+    id: generateUUID(),
+    companyId: auth.companyId,
+    name, type,
+    // ownerUserId queda NULL a propósito: la caja es del negocio. Quién la
+    // puede usar se decide en location_assignments.
+    ownerUserId: null,
+  }).returning().get();
+
+  await logAudit(c.env, {
+    companyId: auth.companyId, userId: auth.userId,
+    action: "location.create", entity: "location", entityId: location.id,
+    detail: { name, type }, ip: getClientIp(c),
+  });
+  return c.json({ ok: true, data: location }, 201);
+});
+
+// GET /locations/assignables — cajas que se pueden asignar (solo admin).
+locations.get("/assignables", requireRole("admin"), async (c) => {
+  const db = drizzle(c.env.DB, { schema });
+  const auth = c.get("auth");
+  return c.json({ ok: true, data: await getAssignableCajas(db, auth.companyId) });
 });
 
 // GET /locations/:id/stock — catálogo + cantidad disponible en ESA ubicación.
@@ -45,7 +106,7 @@ locations.get("/:id/stock", requireAnyModule("inventario", "pos", "facturacion")
 
   const location = await getActiveCompanyLocation(db, auth.companyId, id);
   if (!location) return c.json({ ok: false, error: "Ubicación no encontrada" }, 404);
-  if (!(await canAccessLocation(auth, location))) {
+  if (!(await canAccessLocation(db, auth, location))) {
     return c.json({ ok: false, error: "No tiene permisos para ver esta ubicación" }, 403);
   }
 
@@ -84,7 +145,7 @@ locations.post("/:id/adjust", requireAnyModule("inventario", "pos"), async (c) =
 
   const location = await getActiveCompanyLocation(db, auth.companyId, id);
   if (!location) return c.json({ ok: false, error: "Ubicación no encontrada" }, 404);
-  if (!(await canAccessLocation(auth, location))) {
+  if (!(await canAccessLocation(db, auth, location))) {
     return c.json({ ok: false, error: "No tiene permisos para ajustar esta ubicación" }, 403);
   }
 
