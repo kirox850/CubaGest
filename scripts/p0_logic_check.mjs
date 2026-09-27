@@ -508,7 +508,7 @@ console.log("\n13) Cajas compartidas y turnos");
   check("un cajero no puede tener dos turnos abiertos a la vez",
     /shifts_one_open_per_user/.test(m12));
   check("abrir turno crea la lectura de apertura de ESA caja, en una sola transacción",
-    /openingReadingId: readingId/.test(sh) && /DB\.batch\(stmts\)/.test(sh));
+    /openingReadingId: readingId/.test(sh) && /await db\.batch\(\[/.test(sh));
   check("el turno abierto manda sobre las cajas asignadas",
     /getOpenShiftForUser/.test(lib) && /asignadas\.length === 1/.test(lib));
 
@@ -688,7 +688,54 @@ console.log("\n16) La app no se rompe en silencio cuando falta una migración");
     !/companyId|company_id/.test(hea));
 }
 
-console.log("\n17) El proxy del frontend reenvía la IP real");
+console.log("\n17) Los tres fallos que tumbaron la plataforma");
+{
+  const R = (p) => readFileSync(new URL(p, import.meta.url), "utf8");
+  const sh = R("../src/routes/shifts.ts");
+  const cl = R("../src/routes/closing.ts");
+  const pos = R("../../CubaGest-Web/src/screens/POS.tsx");
+  const inv = R("../../CubaGest-Web/src/screens/Inventario.tsx");
+  const off = R("../../CubaGest-Web/src/offlineDB.ts");
+
+  // 1) El fallo de escritura. .run() EJECUTA la consulta y devuelve el
+  // resultado; castearlo a D1PreparedStatement y pasarlo a DB.batch() escribía
+  // las filas y después lanzaba, así que el turno se guardaba y la pantalla
+  // decía "error interno del servidor".
+  check("nada se castea a D1PreparedStatement para meterlo en un batch",
+    !/as unknown as D1PreparedStatement/.test(sh) && !/as unknown as D1PreparedStatement/.test(cl));
+  check("db.batch recibe las consultas sin ejecutar",
+    /await db\.batch\(\[/.test(sh) && /await db\.batch\(\[/.test(cl));
+  check("y el comentario explica por qué, para que nadie lo 'optimice' otra vez",
+    /\.run\(\) y se casteaba el resultado/.test(sh));
+
+  // 2) IndexedDB. Un fallo al guardar la copia local no puede vaciar el
+  // catálogo que el servidor acaba de mandar.
+  check("guardar la copia local no borra los productos del servidor",
+    /cacheProducts\(scopeOf\(own\.id\), items\)\.catch\(\(\) => \{\}\)/.test(pos)
+    && /cacheProducts\(scope, items\)\.catch\(\(\) => \{\}\)/.test(inv));
+  check("el POS sigue mostrando el catálogo aunque la copia falle",
+    /una mejora, no un\n\s*\/\/ requisito/.test(pos) || /una mejora, no un requisito/.test(pos));
+  check("en offlineDB, leer y escribir son transacciones separadas",
+    /db\.transaction\(\['sales_queue'\], 'readonly'\)/.test(off)
+    && /db\.transaction\(\['products', 'app_meta'\], 'readwrite'\)/.test(off));
+  // El await puede seguir existiendo, pero NUNCA dentro de una transacción
+  // compartida: cada lectura y cada escritura abre la suya.
+  check("ninguna lectura/escritura comparte transacción con un await en medio",
+    !/const store = t\.objectStore\('products'\);[\s\S]{0,400}?await[^\n]*\n[\s\S]{0,400}?store\.put\(/.test(off)
+    && /function readOneProduct/.test(off) && /function putProducts/.test(off));
+  check("el helper que quedó sin usar se borró",
+    !/pendingQtyByProduct/.test(off));
+
+  // 3) El admin. Antes no tenía NINGUNA forma de saber desde qué caja vendía.
+  check("el POS deja al admin elegir la caja si no tiene turno",
+    /user\?\.role === "admin" && cajasVisibles/.test(pos) && /Vendiendo desde/.test(pos));
+  check("y con turno abierto la caja del turno manda sobre lo que haya elegido",
+    /const own = shift \? locs\.find/.test(pos));
+  check("el admin solo puede vender desde cajas, no desde el almacén",
+    /cajasParaVender = locs\.filter\(\(l:any\)=>l\.type==="caja"/.test(pos));
+}
+
+console.log("\n18) El proxy del frontend reenvía la IP real");
 const proxySrc = readFileSync(new URL("../../CubaGest-Web/functions/api/[[path]].ts", import.meta.url), "utf8");
 check("functions/api/[[path]].ts reenvía cf-connecting-ip", /headers\.set\("cf-connecting-ip"/.test(proxySrc));
 check("el proxy corta si el backend se cuelga (AbortController)",

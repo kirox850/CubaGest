@@ -760,13 +760,15 @@ closing.post("/:id/explain", requireModule("cierre"), async (c) => {
   if (!nota) return c.json({ ok: false, error: "Escribe qué pasó" }, 400);
 
   const explicacionId = generateUUID();
-  const stmts: D1PreparedStatement[] = [
+  // La consulta va sin ejecutar: si se ejecuta al construirla y luego falla el
+  // lote, la explicación queda guardada y el cierre nunca pasa a "resuelto",
+  // que era lo que pasaba.
+  await db.batch([
     db.insert(schema.closingExplanations).values({
       id: explicacionId, companyId: auth.companyId, closingId: id,
       currency, amount: Math.abs(amount), note: nota, createdById: auth.userId,
-    }).run() as unknown as D1PreparedStatement,
-  ];
-  await c.env.DB.batch(stmts);
+    }),
+  ]);
 
   // ¿Con esto ya cuadró TODO? Un cierre se resuelve cuando todas sus líneas
   // cuadran: el dinero explicado Y la mercancía contada. La moneda recién

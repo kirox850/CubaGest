@@ -38,33 +38,33 @@ shifts.get("/current", requireAnyModule("pos", "cierre", "inventario", "facturac
   // abriste turno". Una de las dos cosas se arregla abriendo turno; la otra,
   // no se arregla sola y hay que decirlo.
   if (!(await turnosDisponiblesEn(db))) {
-    return c.json({
-      ok: true,
-      data: {
-        shift: null,
-        assignedCajas: [],
-        aviso: "La base de datos todavía no tiene las tablas de turnos. Hay que aplicar la migración 0012 antes de usarlos.",
-      },
-    });
+ return c.json({
+ok: true,
+data: {
+  shift: null,
+  assignedCajas: [],
+  aviso: "La base de datos todavía no tiene las tablas de turnos. Hay que aplicar la migración 0012 antes de usarlos.",
+},
+ });
   }
 
   const turno = await getOpenShiftForUser(db, auth.companyId, auth.userId);
   if (!turno) {
-    return c.json({ ok: true, data: { shift: null, assignedCajas: auth.role === "cajero" ? await getCajasAsignadas(db, auth.companyId, auth.userId) : [] } });
+ return c.json({ ok: true, data: { shift: null, assignedCajas: auth.role === "cajero" ? await getCajasAsignadas(db, auth.companyId, auth.userId) : [] } });
   }
   return c.json({
-    ok: true,
-    data: {
-      shift: {
-        id: turno.id,
-        locationId: turno.locationId,
-        locationName: turno.location.name,
-        startedAt: turno.startedAt,
-        openingReadingId: turno.openingReadingId,
-        baseCash: dinero(turno.baseCash),
-      },
-      assignedCajas: auth.role === "cajero" ? await getCajasAsignadas(db, auth.companyId, auth.userId) : [],
-    },
+ ok: true,
+ data: {
+shift: {
+  id: turno.id,
+  locationId: turno.locationId,
+  locationName: turno.location.name,
+  startedAt: turno.startedAt,
+  openingReadingId: turno.openingReadingId,
+  baseCash: dinero(turno.baseCash),
+},
+assignedCajas: auth.role === "cajero" ? await getCajasAsignadas(db, auth.companyId, auth.userId) : [],
+ },
   });
 });
 
@@ -83,14 +83,14 @@ shifts.post("/start", requireModule("pos"), async (c) => {
   // El admin no necesita asignación: puede abrir turno en cualquier caja de su
   // empresa. Un cajero, solo en las que le hayan asignado.
   if (auth.role !== "admin") {
-    const asignadas = await getCajasAsignadas(db, auth.companyId, auth.userId);
-    if (!asignadas.some((a) => a.id === locationId)) {
-      return c.json({ ok: false, error: "No tienes esa caja asignada. Pídele al administrador que te la asigne." }, 403);
-    }
+ const asignadas = await getCajasAsignadas(db, auth.companyId, auth.userId);
+ if (!asignadas.some((a) => a.id === locationId)) {
+return c.json({ ok: false, error: "No tienes esa caja asignada. Pídele al administrador que te la asigne." }, 403);
+ }
   }
   const location = await getActiveCompanyLocation(db, auth.companyId, locationId);
   if (!location || location.type !== "caja") {
-    return c.json({ ok: false, error: "Esa caja no existe o está desactivada" }, 404);
+ return c.json({ ok: false, error: "Esa caja no existe o está desactivada" }, 404);
   }
 
   // Una caja con turno abierto no se puede tomar. Sin esto, dos personas
@@ -98,56 +98,62 @@ shifts.post("/start", requireModule("pos"), async (c) => {
   // veces.
   const ocupada = await getOpenShiftForLocation(db, auth.companyId, locationId);
   if (ocupada) {
-    const otro = await db.select({ name: schema.users.name }).from(schema.users)
-      .where(eq(schema.users.id, ocupada.userId)).get();
-    return c.json({ ok: false, error: `Esa caja ya está en uso${otro?.name ? ` por ${otro.name}` : ""}. Ciérrale el turno o usa otra caja.` }, 409);
+ const otro = await db.select({ name: schema.users.name }).from(schema.users)
+.where(eq(schema.users.id, ocupada.userId)).get();
+ return c.json({ ok: false, error: `Esa caja ya está en uso${otro?.name ? ` por ${otro.name}` : ""}. Ciérrale el turno o usa otra caja.` }, 409);
   }
 
   const yaTengo = await getOpenShiftForUser(db, auth.companyId, auth.userId);
   if (yaTengo) {
-    return c.json({ ok: false, error: `Ya tienes un turno abierto en ${yaTengo.location.name}. Ciérralo antes de abrir otro.` }, 409);
+ return c.json({ ok: false, error: `Ya tienes un turno abierto en ${yaTengo.location.name}. Ciérralo antes de abrir otro.` }, 409);
   }
 
   // La lectura de apertura ES la foto del stock con la que arranca el turno.
   // Se crea aquí, en el servidor, para que sea la misma para todos los que
   // vean el turno.
   const products = await db.select().from(schema.products)
-    .where(and(eq(schema.products.companyId, auth.companyId), eq(schema.products.active, true))).all();
+ .where(and(eq(schema.products.companyId, auth.companyId), eq(schema.products.active, true))).all();
   const stockRows = await db.select().from(schema.locationStock)
-    .where(eq(schema.locationStock.locationId, location.id)).all();
+ .where(eq(schema.locationStock.locationId, location.id)).all();
   const stockBy = new Map(stockRows.map((r) => [r.productId, Number(r.qty)]));
 
   const readingId = generateUUID();
   const items = products.map((p) => ({
-    productId: p.id, productCode: p.code, productName: p.name, unit: p.unit,
-    qty: stockBy.get(p.id) ?? 0,
+ productId: p.id, productCode: p.code, productName: p.name, unit: p.unit,
+ qty: stockBy.get(p.id) ?? 0,
   }));
 
   const shiftId = generateUUID();
   // db.batch es una sola transacción: o queda el turno y su lectura, o no queda
   // ninguno. Nunca un turno abierto sin su punto de partida.
-  const stmts: D1PreparedStatement[] = [];
-  stmts.push(db.insert(schema.shifts).values({
-    id: shiftId, companyId: auth.companyId, locationId: location.id, userId: auth.userId,
-    status: "abierto", openingReadingId: readingId, baseCash,
-  }).run() as unknown as D1PreparedStatement);
-  stmts.push(db.insert(schema.inventoryReadings).values({
-    id: readingId, companyId: auth.companyId, locationId: location.id, takenById: auth.userId,
-    type: "apertura", notes: `Inicio de turno en ${location.name}`, items,
-  }).run() as unknown as D1PreparedStatement);
-  await c.env.DB.batch(stmts);
+  //
+  // A db.batch se le pasan las consultas SIN ejecutar. Antes se les llamaba
+  // .run() y se casteaba el resultado a D1PreparedStatement: eso escribía las
+  // dos filas al momento y luego D1 reventaba porque no eran consultas, así
+  // que el turno se guardaba y la pantalla decía "error interno del servidor".
+  // Reintentar volvía a fallar, pero por el motivo contrario: ya existía.
+  await db.batch([
+ db.insert(schema.shifts).values({
+id: shiftId, companyId: auth.companyId, locationId: location.id, userId: auth.userId,
+status: "abierto", openingReadingId: readingId, baseCash,
+ }),
+ db.insert(schema.inventoryReadings).values({
+id: readingId, companyId: auth.companyId, locationId: location.id, takenById: auth.userId,
+type: "apertura", notes: `Inicio de turno en ${location.name}`, items,
+ }),
+  ]);
 
   await logAudit(c.env, {
-    companyId: auth.companyId, userId: auth.userId,
-    action: "shift.start", entity: "shift", entityId: shiftId,
-    detail: { locationName: location.name }, ip: getClientIp(c),
+ companyId: auth.companyId, userId: auth.userId,
+ action: "shift.start", entity: "shift", entityId: shiftId,
+ detail: { locationName: location.name }, ip: getClientIp(c),
   });
 
   return c.json({
-    ok: true,
-    data: {
-      shift: { id: shiftId, locationId: location.id, locationName: location.name, startedAt: new Date(), openingReadingId: readingId, baseCash },
-    },
+ ok: true,
+ data: {
+shift: { id: shiftId, locationId: location.id, locationName: location.name, startedAt: new Date(), openingReadingId: readingId, baseCash },
+ },
   }, 201);
 });
 
@@ -160,13 +166,13 @@ shifts.post("/end", requireAnyModule("pos", "cierre"), async (c) => {
   if (!turno) return c.json({ ok: false, error: "No tienes ningún turno abierto" }, 400);
 
   await db.update(schema.shifts)
-    .set({ status: "cerrado", endedAt: new Date() })
-    .where(eq(schema.shifts.id, turno.id));
+ .set({ status: "cerrado", endedAt: new Date() })
+ .where(eq(schema.shifts.id, turno.id));
 
   await logAudit(c.env, {
-    companyId: auth.companyId, userId: auth.userId,
-    action: "shift.end", entity: "shift", entityId: turno.id,
-    detail: { locationName: turno.location.name }, ip: getClientIp(c),
+ companyId: auth.companyId, userId: auth.userId,
+ action: "shift.end", entity: "shift", entityId: turno.id,
+ detail: { locationName: turno.location.name }, ip: getClientIp(c),
   });
 
   return c.json({ ok: true, data: { closed: turno.id } });
@@ -192,42 +198,53 @@ shifts.put("/assignments/:userId", requireRole("admin"), async (c) => {
   const pedidas: string[] = Array.isArray(body.locationIds) ? body.locationIds : [];
 
   const usuario = await db.select().from(schema.users)
-    .where(and(eq(schema.users.id, userId), eq(schema.users.companyId, auth.companyId))).get();
+ .where(and(eq(schema.users.id, userId), eq(schema.users.companyId, auth.companyId))).get();
   if (!usuario) return c.json({ ok: false, error: "Usuario no encontrado" }, 404);
 
   // Validar que todas son cajas de ESTA empresa. Sin esto, alguien podría
   // asignar la caja de otra empresa metiendo un id ajeno.
   const validas: string[] = [];
   for (const id of pedidas) {
-    const loc = await getActiveCompanyLocation(db, auth.companyId, id);
-    if (!loc || loc.type !== "caja") continue;
-    validas.push(id);
+ const loc = await getActiveCompanyLocation(db, auth.companyId, id);
+ if (!loc || loc.type !== "caja") continue;
+ validas.push(id);
   }
 
   const actuales = await getCajasAsignadas(db, auth.companyId, userId);
-  const stmts: D1PreparedStatement[] = [];
+  // Se arman primero las consultas y se ejecutan después, todas juntas y en
+  // una sola transacción. El mismo error que en el inicio de turno: si se
+  // ejecutan al construirlas, la asignación se guarda y la pantalla avisa de
+  // que falló, que es peor que no avisar nada porque no se sabe si ocurrió.
+  const stmts = [];
   for (const a of actuales) {
-    if (!validas.includes(a.id)) {
-      stmts.push(db.delete(schema.locationAssignments).where(and(
-        eq(schema.locationAssignments.companyId, auth.companyId),
-        eq(schema.locationAssignments.userId, userId),
-        eq(schema.locationAssignments.locationId, a.id),
-      )).run() as unknown as D1PreparedStatement);
-    }
+ if (!validas.includes(a.id)) {
+stmts.push(db.delete(schema.locationAssignments).where(and(
+  eq(schema.locationAssignments.companyId, auth.companyId),
+  eq(schema.locationAssignments.userId, userId),
+  eq(schema.locationAssignments.locationId, a.id),
+)));
+ }
   }
   for (const id of validas) {
-    if (!actuales.some((a) => a.id === id)) {
-      stmts.push(db.insert(schema.locationAssignments).values({
-        id: generateUUID(), companyId: auth.companyId, userId, locationId: id,
-      }).run() as unknown as D1PreparedStatement);
-    }
+ if (!actuales.some((a) => a.id === id)) {
+stmts.push(db.insert(schema.locationAssignments).values({
+  id: generateUUID(), companyId: auth.companyId, userId, locationId: id,
+}));
+ }
   }
-  if (stmts.length) await c.env.DB.batch(stmts);
+  if (stmts.length) {
+ // db.batch pide el tipo de una tupla con al menos un elemento. Acá ya se
+ // comprobó que no está vacía, pero TypeScript no puede deducir eso de un
+ // array. Este cast es SOLO de tipado: en ejecución se pasa el array tal
+ // cual, sin truco ni trampa. (A diferencia del que había antes, que
+ // mentía sobre lo que se pasaba en runtime.)
+ await db.batch(stmts as [typeof stmts[number], ...typeof stmts[number][]]);
+  }
 
   await logAudit(c.env, {
-    companyId: auth.companyId, userId: auth.userId,
-    action: "shift.assign_boxes", entity: "user", entityId: userId,
-    detail: { cajas: validas.length }, ip: getClientIp(c),
+ companyId: auth.companyId, userId: auth.userId,
+ action: "shift.assign_boxes", entity: "user", entityId: userId,
+ detail: { cajas: validas.length }, ip: getClientIp(c),
   });
 
   return c.json({ ok: true, data: await getCajasAsignadas(db, auth.companyId, userId) });
