@@ -481,6 +481,18 @@ closing.post("/confirm", requireModule("cierre"), async (c) => {
   // producto contado y los totales de empresa. Si algo falla, no queda un
   // cierre a medias ni un stock movido sin registro.
   const stmts: D1PreparedStatement[] = [
+    // LA LECTURA VA PRIMERO, y el motivo es el mismo que en el inicio de turno:
+    // cash_closings.closing_reading_id es clave foránea a inventory_readings, y
+    // SQLite comprueba las claves foráneas en el momento de cada INSERT, no al
+    // cerrar la transacción. Con el cierre antes, apuntaba a una lectura que
+    // todavía no existía y D1 devolvía "FOREIGN KEY constraint failed".
+    c.env.DB.prepare(
+      `INSERT INTO inventory_readings (id, company_id, location_id, taken_by_id, type, notes, items, created_at)
+       VALUES (?, ?, ?, ?, 'cierre', ?, ?, ?)`
+    ).bind(
+      closingReadingId, auth.companyId, locationId, auth.userId,
+      "Generada automaticamente al cierre", JSON.stringify(closingReadingItems), Date.now()
+    ),
     c.env.DB.prepare(
       `INSERT INTO cash_closings (id, company_id, location_id, closed_by_id, initial_reading_id,
                                   closing_reading_id, confirm_key, period_start, period_end,
@@ -514,13 +526,7 @@ closing.post("/confirm", requireModule("cierre"), async (c) => {
       (body.notes || "").trim() || null,
       Date.now()
     ),
-    c.env.DB.prepare(
-      `INSERT INTO inventory_readings (id, company_id, location_id, taken_by_id, type, notes, items, created_at)
-       VALUES (?, ?, ?, ?, 'cierre', ?, ?, ?)`
-    ).bind(
-      closingReadingId, auth.companyId, locationId, auth.userId,
-      "Generada automaticamente al cierre", JSON.stringify(closingReadingItems), Date.now()
-    ),
+
   ];
 
   for (const item of closingItems) {

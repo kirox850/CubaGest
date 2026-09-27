@@ -55,14 +55,27 @@ export async function runBatch(
   return results.map((r) => Number(r?.meta?.changes ?? 0));
 }
 
-/** Fila de location_stock para (ubicación, producto), creándola si falta. */
+/**
+ * Fila de location_stock para (ubicación, producto), creándola si falta.
+ *
+ * OJO con el paréntesis que cierra VALUES. Faltaba, y eso no es un detalle
+ * Invisible: SQLite leía la lista de valores, esperaba un cierre o una coma,
+ * se encontraba un "ON" y devolvía
+ *
+ *     near "ON": syntax error at offset 110
+ *
+ * lo que tumbaba TODAS las ventas, todos los cierres y todos los traspasos,
+ * porque las tres cosas empiezan por esta sentencia. El error sale de D1
+ * dentro de un lote, así que la pantalla solo puede decir "no se pudo
+ * registrar" y nunca dice qué pasó de verdad.
+ */
 export function ensureLocationStockStmt(
   db: D1DB, locationId: string, productId: string
 ): D1PreparedStatement {
   return db
     .prepare(
       `INSERT INTO location_stock (id, location_id, product_id, qty, updated_at)
-       VALUES (?, ?, ?, 0, ?
+       VALUES (?, ?, ?, 0, ?)
        ON CONFLICT(location_id, product_id) DO NOTHING`
     )
     .bind(generateUUID(), locationId, productId, Date.now());

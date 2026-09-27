@@ -766,7 +766,65 @@ console.log("\n18) La clave foránea del turno y el catálogo que se pinta");
     /loadFromCache/.test(pos) && /if \(!online\)/.test(pos));
 }
 
-console.log("\n19) El proxy del frontend reenvía la IP real");
+console.log("\n19) El SQL se comprueba antes de subirlo");
+{
+  const fs2 = await import("node:fs");
+  const path2 = await import("node:path");
+  const raiz = new URL("../src/", import.meta.url).pathname;
+
+  // Un paréntesis sin cerrar en VALUES produces
+  //   near "ON": syntax error
+  // y tumba la venta, el cierre, el traspaso y el ajuste de stock, porque las
+  // cuatro empiezan por la misma sentencia. D1 lo lanza DENTRO del lote, así
+  // que la pantalla solo puede decir "no se pudo registrar".
+  // Estas comprueban TODAS las sentencias con ON CONFLICT, no solo la que se
+  // rompió, para que la siguiente no tenga que romperse también.
+  const rotas = [];
+  let total = 0;
+  const recorrer = (dir) => {
+    for (const e of fs2.readdirSync(dir, { withFileTypes: true })) {
+      const p = path2.join(dir, e.name);
+      if (e.isDirectory()) { recorrer(p); continue; }
+      if (!p.endsWith(".ts")) continue;
+      const txt = fs2.readFileSync(p, "utf8");
+      for (const m of txt.matchAll(/`([^`]*ON\s+CONFLICT[^`]*)`/gs)) {
+        total++;
+        const antes = m[1].slice(0, m[1].toUpperCase().indexOf("ON CONFLICT"));
+        if (!antes.trimEnd().endsWith(")")) rotas.push(path2.basename(p));
+      }
+    }
+  };
+  recorrer(raiz);
+  check(`las ${total} sentencias con ON CONFLICT cierran su VALUES`, rotas.length === 0);
+  if (rotas.length) console.log("       rotas en: " + [...new Set(rotas)].join(", "));
+
+  // La clave foránea del cierre, igual que la del turno.
+  const clo = readFileSync(new URL("../src/routes/closing.ts", import.meta.url), "utf8");
+  const iLect = clo.indexOf("INSERT INTO inventory_readings");
+  const iClo = clo.indexOf("INSERT INTO cash_closings");
+  check("la lectura de cierre se inserta antes que el cierre que la referencia",
+    iLect > 0 && iClo > iLect);
+  const shi = readFileSync(new URL("../src/routes/shifts.ts", import.meta.url), "utf8");
+  const sL = shi.indexOf("db.insert(schema.inventoryReadings)");
+  const sT = shi.indexOf("db.insert(schema.shifts)");
+  check("y la de apertura antes que el turno (el mismo error, dos sitios)",
+    sL > 0 && sT > sL);
+}
+
+console.log("\n20) El servidor va antes que el disco local");
+{
+  const fac = readFileSync(new URL("../../CubaGest-Web/src/screens/Facturacion.tsx", import.meta.url), "utf8");
+  const iApi = fac.indexOf('apiFetch("/sales")');
+  const iLocal = fac.indexOf("getAllOfflineSales(account)");
+  check("facturas pide al servidor antes de leer la cola local",
+    iApi > 0 && iLocal > iApi);
+  check("y un fallo de la cola local no se come la respuesta del servidor",
+    /catch\s*\{[\s\S]{0,200}setOfflineSales\(\[\]\)/.test(fac));
+  check("porque la cola local es un extra, no un requisito para ver facturas",
+    /[Ss]in la cola local se ven igual las facturas/.test(fac));
+}
+
+console.log("\n21) El proxy del frontend reenvía la IP real");
 const proxySrc = readFileSync(new URL("../../CubaGest-Web/functions/api/[[path]].ts", import.meta.url), "utf8");
 check("functions/api/[[path]].ts reenvía cf-connecting-ip", /headers\.set\("cf-connecting-ip"/.test(proxySrc));
 check("el proxy corta si el backend se cuelga (AbortController)",
