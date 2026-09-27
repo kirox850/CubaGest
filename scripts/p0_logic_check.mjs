@@ -706,7 +706,7 @@ console.log("\n17) Los tres fallos que tumbaron la plataforma");
   check("db.batch recibe las consultas sin ejecutar",
     /await db\.batch\(\[/.test(sh) && /await db\.batch\(\[/.test(cl));
   check("y el comentario explica por qué, para que nadie lo 'optimice' otra vez",
-    /\.run\(\) y se casteaba el resultado/.test(sh));
+    /un cast que mentía sobre el\n\s*\/\/ tipo/.test(sh) || /cast que mentía sobre el/.test(sh));
 
   // 2) IndexedDB. Un fallo al guardar la copia local no puede vaciar el
   // catálogo que el servidor acaba de mandar.
@@ -714,7 +714,7 @@ console.log("\n17) Los tres fallos que tumbaron la plataforma");
     /cacheProducts\(scopeOf\(own\.id\), items\)\.catch\(\(\) => \{\}\)/.test(pos)
     && /cacheProducts\(scope, items\)\.catch\(\(\) => \{\}\)/.test(inv));
   check("el POS sigue mostrando el catálogo aunque la copia falle",
-    /una mejora, no un\n\s*\/\/ requisito/.test(pos) || /una mejora, no un requisito/.test(pos));
+    /nunca para decidir qué se ve ahora/.test(pos));
   check("en offlineDB, leer y escribir son transacciones separadas",
     /db\.transaction\(\['sales_queue'\], 'readonly'\)/.test(off)
     && /db\.transaction\(\['products', 'app_meta'\], 'readwrite'\)/.test(off));
@@ -735,7 +735,38 @@ console.log("\n17) Los tres fallos que tumbaron la plataforma");
     /cajasParaVender = locs\.filter\(\(l:any\)=>l\.type==="caja"/.test(pos));
 }
 
-console.log("\n18) El proxy del frontend reenvía la IP real");
+console.log("\n18) La clave foránea del turno y el catálogo que se pinta");
+{
+  const R = (p) => readFileSync(new URL(p, import.meta.url), "utf8");
+  const sh = R("../src/routes/shifts.ts");
+  const pos = R("../../CubaGest-Web/src/screens/POS.tsx");
+  const shCodigo = sh.replace(/\/\/.*$/gm, "").replace(/\*\*[\s\S]*?\*\//g, "");
+
+  // El 500 que tumbaba POST /shift/start. shifts.opening_reading_id apunta a
+  // inventory_readings y SQLite comprueba la clave foránea en cada INSERT, no
+  // al cerrar la transacción: con el turno primero, la base lo rechaza.
+  const iLectura = shCodigo.indexOf("db.insert(schema.inventoryReadings).values(");
+  const iTurno = shCodigo.indexOf("db.insert(schema.shifts).values(");
+  check("la lectura de apertura se inserta ANTES que el turno que la referencia",
+    iLectura > 0 && iTurno > iLectura);
+  check("y el motivo está escrito, para que nadie lo 'optimice' al revés",
+    /comprueba las claves foráneas/.test(sh) && /FOREIGN KEY constraint failed/.test(sh));
+
+  // El catálogo se pinta desde el servidor, no desde el caché local.
+  const iApi = pos.indexOf("await apiFetch(`/locations/${own.id}/stock`)");
+  const iPinta = pos.indexOf("setProducts(applyStock(items))", iApi);
+  const iCache = pos.indexOf("cacheProducts(scopeOf(own.id), items)", iApi);
+  check("con internet, la lista se pinta con la respuesta del servidor",
+    iApi > 0 && iPinta > iApi);
+  check("y NO se relee de IndexedDB después de guardar (eso era la carrera)",
+    iCache > 0 && !/loadFromCache\(own\.id\)/.test(pos));
+  check("el caché se guarda sin esperar y sin romper nada si falla",
+    /cacheProducts\(scopeOf\(own\.id\), items\)\.catch\(\(\) => \{\}\)/.test(pos));
+  check("sin internet se sigue usando el caché, que es para eso",
+    /loadFromCache/.test(pos) && /if \(!online\)/.test(pos));
+}
+
+console.log("\n19) El proxy del frontend reenvía la IP real");
 const proxySrc = readFileSync(new URL("../../CubaGest-Web/functions/api/[[path]].ts", import.meta.url), "utf8");
 check("functions/api/[[path]].ts reenvía cf-connecting-ip", /headers\.set\("cf-connecting-ip"/.test(proxySrc));
 check("el proxy corta si el backend se cuelga (AbortController)",
