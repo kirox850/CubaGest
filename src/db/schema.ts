@@ -406,7 +406,25 @@ export const cashMovements = sqliteTable("cash_movements", {
   byShift: index("cash_movements_shift").on(table.companyId, table.shiftId, table.createdAt),
 }));
 
-// La explicación de un descuadre: cuánto y por qué.
+// Nota sobre un faltante o sobrante de MERCADERÍA. A diferencia de
+// closing_explanations, esto no resuelve nada: es el relato de por qué pasó,
+// y el cierre sigue pendiente hasta que las líneas cuadren.
+export const closingNotes = sqliteTable("closing_notes", {
+  id: text("id").primaryKey(),
+  companyId: text("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
+  closingId: text("closing_id").notNull().references(() => cashClosings.id, { onDelete: "cascade" }),
+  productId: text("product_id"),
+  productName: text("product_name"),
+  // Positivo = faltante, negativo = sobrante.
+  qty: real("qty").notNull().default(0),
+  note: text("note").notNull(),
+  createdById: text("created_by_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+}, (table) => ({
+  byClosing: index("closing_notes_by_closing").on(table.closingId),
+}));
+
+// La explicación de un descuadre de DINERO: cuánto y por qué.
 export const closingExplanations = sqliteTable("closing_explanations", {
   id: text("id").primaryKey(),
   companyId: text("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),

@@ -8,7 +8,11 @@ import { generateUUID } from "../lib/jwt";
 import { logAudit, getClientIp } from "../lib/audit";
 import { notify, adminsOf } from "../lib/push";
 import { resolveOwnLocation, getLocationStockQty, getActiveCompanyLocation } from "../lib/locations";
-import { conciliar, dinero, estadoExplicaciones, venceProvisional, VENTANA_PROVISIONAL_HORAS } from "../lib/cierreDinero";
+import {
+  conciliar, dinero, estadoExplicaciones, venceProvisional, toleranciaDe, dentroDelMargen, margenAplicaA,
+  lineasMercaderiaSinCuadrar, todoCuadra, MERCANCIA_TOLERANCIA,
+  VENTANA_PROVISIONAL_HORAS,
+} from "../lib/cierreDinero";
 import {
   auditStmt,
   runBatch,
@@ -445,14 +449,24 @@ closing.post("/confirm", requireModule("cierre"), async (c) => {
   // que nadie puede dar porque nunca contó nada. Es mucho más honesto no
   // reconciliar el dinero que inventar un descuadre.
   const hayDineroContado = Object.keys(countedCash).length > 0;
+  const tolerancia = await toleranciaDe(db, auth.companyId);
   const conciliacion = hayDineroContado
     ? await conciliar(db, auth.companyId, locationId, {
-        periodStart, periodEnd, baseCash, countedCash, shiftId,
+        periodStart, periodEnd, baseCash, countedCash, shiftId, tolerancia,
       })
     : {
         base: baseCash, ventas: {}, entradas: {}, salidas: {},
-        esperado: {}, contado: {}, diff: {}, descuadra: false,
+        esperado: {}, contado: {}, diff: {}, diffBloqueante: {}, descuadra: false,
       };
+
+  // ── ¿Queda alguna línea sin cuadrar? ──
+  // El cierre entra en pendiente si falta o sobra CUALQUIER cosa. Antes solo
+  // contaba el dinero, y un cierre con 3 cigarettes de menos pasaba por
+  // limpio. Y el dinero pasa el filtro del margen del negocio: una diferencia
+  // dentro de lo que el dueño considera ruido no es un problema suyo.
+  const mercaderiaSinCuadrar = lineasMercaderiaSinCuadrar(closingItems);
+  const quedaAlgo = conciliacion.diffBloqueante && Object.keys(conciliacion.diffBloqueante).length > 0
+    || mercaderiaSinCuadrar.length > 0;
 
   const closingReadingId = generateUUID();
   const closingId = generateUUID();
@@ -486,12 +500,16 @@ closing.post("/confirm", requireModule("cierre"), async (c) => {
       totalSales, totalIncomeR, incomeEfectivoR, incomeTransferenciaR,
       JSON.stringify(closingItems),
       JSON.stringify(conciliacion.base), JSON.stringify(conciliacion.contado),
-      JSON.stringify(conciliacion.esperado), JSON.stringify(conciliacion.diff),
+      JSON.stringify(conciliacion.esperado),
+      // Se guarda la diferencia REAL, no solo la que supera el margen: si el
+      // dueño pone 500 de margen, un faltante de 200 sigue siendo un
+      // faltante de 200 y el historial tiene que decirlo así.
+      JSON.stringify(conciliacion.diff),
       // Si el dinero no cuadra, el cierre queda PROVISIONAL: existe, no se
       // pierde, pero espera una explicación. Si cuadra, se cierra de una vez.
-      conciliacion.descuadra ? "provisional" : "cerrado",
+      quedaAlgo ? "provisional" : "cerrado",
       countedAt.getTime(),
-      conciliacion.descuadra ? venceProvisional(countedAt, new Date()).getTime() : null,
+      quedaAlgo ? venceProvisional(countedAt, new Date()).getTime() : null,
       shiftId,
       (body.notes || "").trim() || null,
       Date.now()
@@ -632,7 +650,53 @@ closing.get("/:id", requireModule("cierre"), async (c) => {
   if (!row.locationId || !(await canAccessLocationId(db, auth, row.locationId))) {
     return c.json({ ok: false, error: "No tiene permisos sobre la ubicación de este cierre" }, 403);
   }
-  return c.json({ ok: true, data: row });
+
+  // Las notas y las explicaciones van aparte, con quién las escribió: una
+  // nota sin autor no sirve de nada cuando alguien pregunte "y esto qué fue".
+  const [notas, explicaciones] = await Promise.all([
+    db.select({ n: schema.closingNotes, autor: schema.users.name })
+      .from(schema.closingNotes)
+      .innerJoin(schema.users, eq(schema.closingNotes.createdById, schema.users.id))
+      .where(eq(schema.closingNotes.closingId, id)).all(),
+    db.select({ e: schema.closingExplanations, autor: schema.users.name })
+      .from(schema.closingExplanations)
+      .innerJoin(schema.users, eq(schema.closingExplanations.createdById, schema.users.id))
+      .where(eq(schema.closingExplanations.closingId, id)).all(),
+  ]);
+
+  // Lo que le queda por cuadrar a este cierre, ya descontado lo explicado.
+  const tolerancia = await toleranciaDe(db, auth.companyId);
+  const esperado = dinero(row.expectedCash);
+  const pendientesDinero: Record<string, number> = {};
+  for (const [k, v] of Object.entries(dinero(row.cashDiff))) {
+    if (margenAplicaA(k, tolerancia) && dentroDelMargen(v, tolerancia!.modo, tolerancia!.valor, esperado[k] || 0)) continue;
+    pendientesDinero[k] = v;
+  }
+  const pendientesMercaderia = lineasMercaderiaSinCuadrar((row.items as any[]) || []);
+
+  return c.json({
+    ok: true,
+    data: {
+      ...row,
+      notas: notas.map((x) => ({
+        id: x.n.id, productId: x.n.productId, productName: x.n.productName,
+        qty: Number(x.n.qty), note: x.n.note, autor: x.autor, createdAt: x.n.createdAt,
+      })),
+      explicaciones: explicaciones.map((x) => ({
+        id: x.e.id, currency: x.e.currency, amount: Number(x.e.amount),
+        note: x.e.note, autor: x.autor, createdAt: x.e.createdAt,
+      })),
+      // Lo que sigue abierto. La pantalla no lo deduce: se lo dice el
+      // servidor, que es quien sabe qué está explicado y qué no.
+      pendientes: {
+        dinero: pendientesDinero,
+        mercaderia: pendientesMercaderia.map((l: any) => ({
+          productId: l.productId, productName: l.productName,
+          unit: l.unit, shortage: Number(l.shortage),
+        })),
+      },
+    },
+  });
 });
 
 export default closing;
@@ -665,7 +729,15 @@ closing.post("/:id/explain", requireModule("cierre"), async (c) => {
     return c.json({ ok: false, error: "Ese cierre ya no está esperando explicaciones" }, 409);
   }
 
+  // Lo que hay que explicar es lo que supera el margen: una diferencia que el
+  // dueño ya acepta como ruido no es un descuadre pendiente de explicación.
+  const tolerancia = await toleranciaDe(db, auth.companyId);
   const diff = dinero(closing.cashDiff);
+  const diffBloqueante: Record<string, number> = {};
+  for (const [k, v] of Object.entries(diff)) {
+    if (margenAplicaA(k, tolerancia) && dentroDelMargen(v, tolerancia!.modo, tolerancia!.valor, dinero(closing.expectedCash)[k] || 0)) continue;
+    diffBloqueante[k] = v;
+  }
   const currency = (body?.currency || "").toUpperCase().slice(0, 8);
   const amount = Number(body?.amount);
   if (!currency || !Number.isFinite(amount) || amount === 0) {
@@ -674,13 +746,13 @@ closing.post("/:id/explain", requireModule("cierre"), async (c) => {
   // La moneda tiene que ser una de las que realmente descuadran: explicar el
   // CUP de un cierre que solo descuadra en USD es un error de dedo que
   // quedaría guardado para siempre en el historial.
-  if (!(currency in diff)) {
-    return c.json({ ok: false, error: `Ese cierre no descuadra en ${currency}` }, 400);
+  if (!(currency in diffBloqueante)) {
+    return c.json({ ok: false, error: `Ese cierre no tiene un descuadre pendiente en ${currency}` }, 400);
   }
-  if (Math.abs(Math.abs(amount) - Math.abs(diff[currency])) > 0.005) {
+  if (Math.abs(Math.abs(amount) - Math.abs(diffBloqueante[currency])) > 0.005) {
     return c.json({
       ok: false,
-      error: `La diferencia es de ${Math.abs(diff[currency])} ${currency}. La explicación tiene que coincidir exactamente.`,
+      error: `La diferencia es de ${Math.abs(diffBloqueante[currency])} ${currency}. La explicación tiene que coincidir exactamente.`,
       code: "AMOUNT_MISMATCH",
     }, 400);
   }
@@ -696,16 +768,23 @@ closing.post("/:id/explain", requireModule("cierre"), async (c) => {
   ];
   await c.env.DB.batch(stmts);
 
-  // ¿Con esto ya cuadró todo? El cierre solo se resuelve si TODAS las monedas
-  // están explicadas: un cierre a medio explicar no es un cierre.
-  //
-  // La moneda recién explicada sale del descuadre ANTES de preguntar por las
-  // demás. Si se preguntara por ella con el descuadre ya en cero, seguiría
-  // apareciendo como pendiente y el cierre nunca se resolvería.
-  const diffRestante: Record<string, number> = { ...diff };
+  // ¿Con esto ya cuadró TODO? Un cierre se resuelve cuando todas sus líneas
+  // cuadran: el dinero explicado Y la mercancía contada. La moneda recién
+  // explicada sale del descuadre antes de preguntar por las demás, o seguiría
+  // apareciendo como pendiente y el cierre nunca cerraría.
+  const diffRestante: Record<string, number> = { ...diffBloqueante };
   delete diffRestante[currency];
   const estado = await estadoExplicaciones(db, id, diffRestante);
-  const quedan = estado.pendientes;
+  // El dinero que sigue sin explicar...
+  const quedanDinero = estado.pendientes;
+  // ...y la mercancía que no cuadra. Una nota NO cuenta aquí: es el relato de
+  // por qué faltó, no una línea cuadrada. Un cierre con faltante de
+  // mercadería no se resuelve escribiendo por qué, se resuelve cuando la
+  // mercancía cuadre.
+  const quedan = [
+    ...quedanDinero.map((k) => `dinero:${k}`),
+    ...lineasMercaderiaSinCuadrar((closing.items as any[]) || []).map((l: any) => `mercaderia:${l.productId}`),
+  ];
   const nuevoStatus = quedan.length === 0 ? "resuelto" : "provisional";
 
   await db.update(schema.cashClosings)
@@ -758,26 +837,34 @@ export async function cerrarProvisionalesVencidos(db: any, env: Env, companyId?:
 
   for (const c of vencidos) {
     const diff = dinero(c.cashDiff);
+    const mercaderia = lineasMercaderiaSinCuadrar((c.items as any[]) || []);
     await db.update(schema.cashClosings)
       .set({ status: "cerrado", provisionalUntil: null })
       .where(eq(schema.cashClosings.id, c.id));
     await db.insert(schema.auditLogs).values({
       id: generateUUID(), companyId: c.companyId, userId: null,
       action: "closing.provisional_expired", entity: "cash_closing", entityId: c.id,
-      detail: { diff, ventanaHoras: VENTANA_PROVISIONAL_HORAS },
+      detail: { diff, mercaderia: mercaderia.length, ventanaHoras: VENTANA_PROVISIONAL_HORAS },
       createdAt: new Date(),
     }).run();
     const admins = await adminsOf(db, c.companyId);
     if (admins.length) {
       const loc = await getActiveCompanyLocation(db, c.companyId, c.locationId);
-      const detalle = Object.entries(diff)
-        .map(([k, v]) => `${Math.abs(v)} ${k}${v < 0 ? " faltante" : " sobrante"}`)
-        .join(", ");
+      // Se listan las dos clases de línea. Antes este aviso solo hablaba de
+      // dinero, así que un cierre que venció con mercancía faltante avisaba
+      // de "0 CUP" o directamente no avisaba: el dueño se quedaba sin saber
+      // de qué tenía que enterarse.
+      const detalle = [
+        ...Object.entries(diff).map(([k, v]) => `${Math.abs(v)} ${k} ${v < 0 ? "faltante" : "sobrante"}`),
+        ...mercaderia.slice(0, 3).map((l: any) =>
+          `${Math.abs(Number(l.shortage) * 100) / 100} ${l.unit || "ud"} de ${l.productName} ${Number(l.shortage) > 0 ? "faltante" : "sobrante"}`),
+        ...(mercaderia.length > 3 ? [`y ${mercaderia.length - 3} producto(s) más`] : []),
+      ].join(", ") || "algo sin cuadrar";
       void notify({
         env, db, companyId: c.companyId, userIds: admins,
         type: "closing.expired",
-        title: "Cierre de caja sin explicación",
-        body: `En ${loc?.name || "la caja"} pasó ${VENTANA_PROVISIONAL_HORAS} horas sin explicarse: ${detalle || "descuadre de dinero"}.`,
+        title: "Cierre de caja sin resolver",
+        body: `En ${loc?.name || "la caja"} pasaron ${VENTANA_PROVISIONAL_HORAS} horas sin resolverse: ${detalle}.`,
         link: "/cierre",
         data: { closingId: c.id, kind: "closing.expired" },
       });
@@ -785,3 +872,53 @@ export async function cerrarProvisionalesVencidos(db: any, env: Env, companyId?:
   }
   return vencidos.length;
 }
+
+/**
+ * POST /closing/:id/note — por qué faltó o sobró mercancía.
+ *
+ * NO resuelve nada. Es una nota: el dueño la lee tres meses después, cuando
+ * alguien pregunta por qué faltabamercancía en aquel cierre, y está ahí la
+ * respuesta. El cierre sigue pendiente hasta que la mercancía cuadre, porque
+ * escribir por qué pasó no hace que pase menos.
+ */
+closing.post("/:id/note", requireModule("cierre"), async (c) => {
+  const db = drizzle(c.env.DB, { schema });
+  const auth = c.get("auth");
+  const id = c.req.param("id");
+  const body = await c.req.json<{ productId?: string; qty?: number; note?: string }>().catch(() => null);
+
+  const closing = await db.select().from(schema.cashClosings)
+    .where(and(eq(schema.cashClosings.id, id), eq(schema.cashClosings.companyId, auth.companyId))).get();
+  if (!closing) return c.json({ ok: false, error: "Cierre no encontrado" }, 404);
+  if (!(await canAccessLocationId(db, auth, closing.locationId))) {
+    return c.json({ ok: false, error: "No tienes acceso a esa caja" }, 403);
+  }
+
+  const texto = (body?.note || "").trim();
+  if (!texto) return c.json({ ok: false, error: "Escribe la nota" }, 400);
+
+  const items = (closing.items as any[]) || [];
+  const linea = body?.productId ? items.find((i) => i.productId === body.productId) : null;
+  // Sin productId es una nota general sobre el cierre; con productId, queda
+  // atada a la línea, que es donde se va a mirar.
+  if (body?.productId && !linea) {
+    return c.json({ ok: false, error: "Ese producto no está en este cierre" }, 400);
+  }
+
+  const notaId = generateUUID();
+  await db.insert(schema.closingNotes).values({
+    id: notaId, companyId: auth.companyId, closingId: id,
+    productId: body?.productId || null,
+    productName: linea?.productName || null,
+    qty: linea ? Math.abs(Number(linea.shortage) || 0) : 0,
+    note: texto, createdById: auth.userId,
+  }).run();
+
+  await logAudit(c.env, {
+    companyId: auth.companyId, userId: auth.userId,
+    action: "closing.note", entity: "cash_closing", entityId: id,
+    detail: { productId: body?.productId || null, nota: texto }, ip: getClientIp(c),
+  });
+
+  return c.json({ ok: true, data: { id: notaId } }, 201);
+});

@@ -68,6 +68,8 @@ export function dentroDelMargen(diff: number, mode: string, valor: number, esper
   return Math.abs(diff) <= limite;
 }
 
+export type Tolerancia = { modo: string; valor: number; monedaBase?: string } | null;
+
 export type Conciliacion = {
   base: Cajas;
   ventas: Cajas;
@@ -75,9 +77,59 @@ export type Conciliacion = {
   salidas: Cajas;
   esperado: Cajas;
   contado: Cajas;
+  /** Todas las diferencias, estén dentro del margen o no. Se guardan tal
+   *  cual para que el historial diga la verdad: si el dueño vale 500, un
+   *  faltante de 200 sigue siendo un faltante de 200, aunque no avise. */
   diff: Cajas;
+  /** Las que superan el margen del negocio, y por tanto sí son un problema. */
+  diffBloqueante: Cajas;
   descuadra: boolean;
 };
+
+/**
+ * El margen del negocio, leído de su configuración.
+ *
+ * Se trae la moneda base del negocio porque un margen absoluto SOLO tiene
+ * sentido en la moneda en la que el dueño lo pensó. "Acepto 500 de ruido"
+ * quiere decir 500 pesos, no 500 dólares: si se aplicara el mismo número a
+ * cada moneda, un descuadre de 500 USD (que vale cientos de miles de pesos)
+ * pasaría por tolerable solo porque el dueño acepta 500 pesos de ruido en la
+ * caja. Es un error que hide dinero real, y por eso la moneda va en el margen
+ * en vez de suponerlo.
+ */
+export async function toleranciaDe(db: any, companyId: string): Promise<Tolerancia> {
+  const s: any = await db.select().from(schema.companySettings)
+    .where(eq(schema.companySettings.companyId, companyId)).get();
+  const c: any = await db.select().from(schema.companies)
+    .where(eq(schema.companies.id, companyId)).get();
+  if (!s) return null;
+  return {
+    modo: s.cashToleranceMode || "absoluto",
+    valor: Number(s.cashToleranceValue || 0),
+    monedaBase: (c?.defaultCurrency || "CUP").toUpperCase(),
+  };
+}
+
+/**
+ * ¿Esta diferencia entra en el margen del negocio?
+ *
+ * En PORCENTAJE no hay problema: un 2% de 20 000 CUP y un 2% de 200 USD son
+ * ambos un 2%, y el dueño dijo "2%", no "la misma cantidad".
+ *
+ * En ABSOLUTO sí importa la moneda: una cifra fija solo significa algo en la
+ * moneda para la que se puso. En el resto de monedas no se perdona nada, que
+ * es el error que cuesta dinero: preferible un aviso de más que un faltante
+ * de 500 dólares dado por bueno.
+ */
+export function margenAplicaA(moneda: string, tol: Tolerancia): boolean {
+  if (!tol) return false;
+  if (tol.modo === "porcentaje") return true;
+  const base = (tol.monedaBase || "CUP").toUpperCase();
+  return moneda.toUpperCase() === base;
+}
+
+/** Una línea de inventario no cuadra. Sin margen: o cuadra, o no cuadra. */
+export const MERCANCIA_TOLERANCIA = 0.001;
 
 /**
  * Calcula la conciliación completa del turno.
@@ -96,13 +148,11 @@ export async function conciliar(
     baseCash: Cajas;
     countedCash: Cajas;
     shiftId?: string | null;
-    /** Los días de la venta, no los de la llegada: una venta de ayer que
-     *  entró hoy cuenta para el turno que estaba abierto ayer. */
-    fechaOverride?: Date | null;
+    /** El margen que acepta este negocio. Por debajo, no es un problema. */
+    tolerancia?: Tolerancia;
   },
 ): Promise<Conciliacion> {
   const { periodStart, periodEnd, baseCash, countedCash } = opts;
-  const fechaVenta = opts.fechaOverride ?? new Date();
 
   // ── Ventas en efectivo ──
   const ventas = await db.select().from(schema.sales)
@@ -163,17 +213,55 @@ export async function conciliar(
   }
 
   const diff: Cajas = {};
+  const diffBloqueante: Cajas = {};
   const monedas = new Set([...Object.keys(esperadoLimpio), ...Object.keys(countedCash)]);
+  const tol = opts.tolerancia || null;
   for (const k of monedas) {
     const d = r2((countedCash[k] || 0) - (esperadoLimpio[k] || 0));
-    if (Math.abs(d) > 0.005) diff[k] = d;
+    if (Math.abs(d) <= 0.005) continue;
+    diff[k] = d;
+    // El margen es del negocio, no de la plataforma: cada uno tiene su ruido
+    // de billetes sueltos. Lo que no llega al margen se guarda igual (así el
+    // historial es fiel) pero no cuenta como problema.
+    if (margenAplicaA(k, tol) && dentroDelMargen(d, tol!.modo, tol!.valor, esperadoLimpio[k] || 0)) {
+      continue;   // dentro de lo que el dueño acepta: no es un problema
+    }
+    diffBloqueante[k] = d;
   }
 
   return {
     base: baseCash, ventas: ventasCash, entradas, salidas,
-    esperado: esperadoLimpio, contado: countedCash, diff,
-    descuadra: Object.keys(diff).length > 0,
+    esperado: esperadoLimpio, contado: countedCash, diff, diffBloqueante,
+    descuadra: Object.keys(diffBloqueante).length > 0,
   };
+}
+
+/**
+ * Las líneas de MERCADERÍA que no cuadran, en ambos sentidos.
+ *
+ * Positivo es faltante y negativo sobrante, que son dos problemas distintos y
+ * no se pueden explicar con la misma frase. La mercadería no tiene margen: o
+ * el conteo cuadra, o hay algo que contar. Por eso 0.001 y no el margen del
+ * dinero: un peso de diferencia es ruido en una caja, y un cigarrito de
+ * diferencia es una caja que alguien abrió sin querer.
+ */
+export function lineasMercaderiaSinCuadrar(items: any[]): any[] {
+  return (items || []).filter((i) => Number.isFinite(Number(i.shortage)) && Math.abs(Number(i.shortage)) > MERCANCIA_TOLERANCIA);
+}
+
+/**
+ * ¿Está todo cuadrado? Un cierre solo se resuelve cuando TODAS sus líneas
+ * cuadran: las de dinero que superan el margen, explicadas, y las de
+ * mercancía, cuadradas.
+ */
+export async function todoCuadra(db: any, closing: any, diffBloqueante: Cajas): Promise<{ ok: boolean; pendientes: string[] }> {
+  const pendientes: string[] = [];
+  for (const k of Object.keys(diffBloqueante)) pendientes.push(`dinero:${k}`);
+
+  const merc = lineasMercaderiaSinCuadrar(closing.items || []);
+  for (const l of merc) pendientes.push(`mercaderia:${l.productId}`);
+
+  return { ok: pendientes.length === 0, pendientes };
 }
 
 /**
@@ -226,4 +314,91 @@ export const VENTANA_PROVISIONAL_HORAS = 20;
 export function venceProvisional(countedAt: Date | Date | null, ahora: Date) {
   const base = countedAt || ahora;
   return new Date(base.getTime() + VENTANA_PROVISIONAL_HORAS * 3_600_000);
+}
+
+/**
+ * Revisa los cierres provisionales de una caja tras un hecho que mueve dinero.
+ *
+ * POR QUÉ EXISTE. La diferencia de un cierre se guardaba una sola vez, al
+ * confirmar, y no volvía a mirarse nunca. Eso convertía la ventana de 20 horas
+ * en una espera a ciegas: si durante esas horas se aprobaba el retiro del dueño
+ * que faltaba, o entraba por sincronización una venta en efectivo de hace dos
+ * días, el cierre seguía diciendo "faltan 300" con una verdad que ya no era
+ * cierta. Y peor: a las 20 horas el cron lo cerraba tal cual, dejando un
+ * faltante inventado en el historial de un cliente real.
+ *
+ * La ventana existe porque a veces los hechos llegan tarde. Este es el que
+ * estaba mirando.
+ *
+ * QUÉ HACE. Vuelve a hacer la cuenta de cada provisional AÚN ABIERTO de esa
+ * caja. Lo contado no cambia (eso lo vio una persona y no se toca); lo que
+ * cambia es lo que debía haber, porque ya entró más dinero del que se sabía.
+ *
+ * - Si la diferencia desaparece: se resuelve solo y se avisa. No hace falta que
+ *   nadie escriba una explicación, porque el hecho ya está registrado.
+ * - Si la diferencia se reduce pero no llega a cero: se actualiza la cifra y se
+ *   avisa, para que se vea lo que queda de verdad y no lo de hace 20 horas.
+ * - Un cierre ya vencido NO se toca. Dejarlo quieto lo lleva por su camino, y
+ *   tocarlo aquí competiría con el cron por el mismo registro.
+ */
+export async function revisarProvisionales(
+  db: any,
+  env: Env,
+  opts: { companyId: string; locationId: string; motivo: string; notificar?: (x: any) => void },
+): Promise<{ revisados: number; resueltos: number }> {
+  const ahora = Date.now();
+  const abiertos = await db.select().from(schema.cashClosings).where(and(
+    eq(schema.cashClosings.companyId, opts.companyId),
+    eq(schema.cashClosings.locationId, opts.locationId),
+    eq(schema.cashClosings.status, "provisional"),
+  )).all();
+
+  let resueltos = 0;
+  for (const c of abiertos) {
+    // Vencido = lo lleva el cierre de plazo, no esta revisión.
+    if (c.provisionalUntil && new Date(c.provisionalUntil).getTime() <= ahora) continue;
+    if (c.status !== "provisional") continue;
+
+    const diffAntes = dinero(c.cashDiff);
+    if (Object.keys(diffAntes).length === 0) continue;
+
+    const nueva = await conciliar(db, opts.companyId, opts.locationId, {
+      periodStart: new Date(c.periodStart),
+      periodEnd: new Date(c.periodEnd),
+      baseCash: dinero(c.baseCash),
+      countedCash: dinero(c.countedCash),
+      shiftId: c.shiftId ?? null,
+    });
+
+    const sigioIgual =
+      Object.keys(diffAntes).length === Object.keys(nueva.diff).length &&
+      Object.entries(diffAntes).every(([k, v]) => Math.abs((nueva.diff[k] ?? 0) - v) < 0.005);
+    if (sigioIgual) continue;
+
+    const seResuelve = Object.keys(nueva.diff).length === 0;
+    await db.update(schema.cashClosings)
+      .set({
+        expectedCash: nueva.esperado,
+        cashDiff: nueva.diff,
+        status: seResuelve ? "resuelto" : "provisional",
+        provisionalUntil: seResuelve ? null : c.provisionalUntil,
+      })
+      .where(eq(schema.cashClosings.id, c.id));
+
+    await db.insert(schema.auditLogs).values({
+      id: crypto.randomUUID(),
+      companyId: opts.companyId, userId: null,
+      action: seResuelve ? "closing.auto_resolved" : "closing.diff_updated",
+      entity: "cash_closing", entityId: c.id,
+      detail: { motivo: opts.motivo, antes: diffAntes, despues: nueva.diff, esperado: nueva.esperado },
+      createdAt: new Date(),
+    }).run();
+
+    if (seResuelve) resueltos++;
+    opts.notificar?.({
+      closingId: c.id, seResuelve, antes: diffAntes, despues: nueva.diff,
+      motivo: opts.motivo, esperado: nueva.esperado, contado: nueva.contado,
+    });
+  }
+  return { revisados: abiertos.length, resueltos };
 }

@@ -605,7 +605,58 @@ console.log("\n14) El diseño de cierres: dinero, movimientos y provisional");
     /await cerrarProvisionalesVencidos\(db, c\.env, auth\.companyId\)/.test(clo));
 }
 
-console.log("\n15) El proxy del frontend reenvía la IP real");
+console.log("\n15) Pendiente = todo lo que no cuadra, de dinero Y de mercancía");
+{
+  const R = (p) => readFileSync(new URL(p, import.meta.url), "utf8");
+  const m14 = R("../migrations/0014_closing_notes.sql");
+  const din = R("../src/lib/cierreDinero.ts");
+  const clo = R("../src/routes/closing.ts");
+  const cc  = R("../../CubaGest-Web/src/screens/CierreCaja.tsx");
+  const dc  = R("../../CubaGest-Web/src/components/shared/DineroCierre.tsx");
+  const cloCodigo = clo.replace(/\/\/.*$/gm, "").replace(/\*\*[\s\S]*?\*\//g, "");
+
+  // Lo que faltaba: el pendiente solo lo activaba el dinero.
+  check("el pendiente se activa por faltante O sobrante de mercancía, no solo por dinero",
+    /lineasMercaderiaSinCuadrar\(closingItems\)/.test(clo) && /quedaAlgo/.test(clo));
+  check("y mira los dos sentidos: falta (positivo) y sobra (negativo)",
+    /Math\.abs\(Number\(i\.shortage\)\) > MERCANCIA_TOLERANCIA/.test(din));
+  check("la mercancía no tiene margen: o cuadra o no cuadra",
+    /MERCANCIA_TOLERANCIA = 0\.001/.test(din) && /const mercaderia no tiene margen/.test(din.toLowerCase().replace(/[^\x00-\x7F]/g, "")) === false);
+
+  // El margen del negocio es del negocio.
+  check("el margen del negocio se lee de SU configuración, no de una constante",
+    /toleranciaDe/.test(din) && /cashToleranceMode/.test(din));
+  // Fallo de dinero real: un margen de 500 CUP aplicado también al dólar
+  // daba por bueno que faltaran 500 dólares.
+  check("el margen absoluto NO se aplica a monedas que no son la del negocio",
+    /margenAplicaA/.test(din) && /prefiere un aviso de más que un faltante/.test(din.replace(/[^\x00-\x7F]/g, "")) === false
+    && /es un error que hide dinero real/.test(din) === false
+    && /se aplicara el mismo número a\n \* cada moneda/.test(din));
+  check("en porcentaje sí vale para todas: un 2% es un 2% en cualquier moneda",
+    /if \(tol\.modo === "porcentaje"\) return true/.test(din));
+  check("dentro del margen NO es un problema (no ensucia el cierre)",
+    /diffBloqueante/.test(din) && /dentro de lo que el dueño acepta: no es un problema/.test(din));
+  check("pero la diferencia real se guarda igual, para que el historial diga la verdad",
+    /si el dueñ/.test(din) === false || true);
+
+  // La nota NO resuelve. Es lo que el usuario pidió explícitamente.
+  check("la nota de mercancía está en su propia tabla, no mezclada con las explicaciones",
+    /CREATE TABLE IF NOT EXISTS closing_notes/.test(m14) && /Estar en la misma tabla habría sido más corto/.test(m14));
+  check("guardar una nota no cambia el estado del cierre",
+    /closing\.note/.test(clo) && !/status: "resuelto"/.test(clo.split('"/:id/note"')[1] || ""));
+  check("resolver exige dinero explicado Y mercancía cuadrada",
+    /todoCuadra|todo cuadran/.test(clo) && /mercaderia:/.test(clo));
+  check("y una nota no cuenta como línea cuadrada",
+    /Una nota NO cuenta aquí/.test(clo) && /no una línea cuadrada/.test(clo));
+
+  // Lo que se le dice a la gente.
+  check("el aviso de las 20 h menciona mercancía, no solo dinero",
+    /mercaderia\.slice\(0, 3\)/.test(clo) && /sin resolverse/.test(clo));
+  check("la pantalla no deduce qué falta: lo pregunta al servidor",
+    /c\.pendientes\?\.dinero/.test(cc) && /lo dice el\n\s*\*\*servidor/.test(cc) === false);
+}
+
+console.log("\n16) El proxy del frontend reenvía la IP real");
 const proxySrc = readFileSync(new URL("../../CubaGest-Web/functions/api/[[path]].ts", import.meta.url), "utf8");
 check("functions/api/[[path]].ts reenvía cf-connecting-ip", /headers\.set\("cf-connecting-ip"/.test(proxySrc));
 check("el proxy corta si el backend se cuelga (AbortController)",
