@@ -83,6 +83,36 @@ export async function getCajaLocationForUser(db: DB, companyId: string, userId: 
 }
 
 /**
+ * ¿Está la base de datos al día con las migraciones?
+ *
+ * Esto parece un detalle y no lo es. Las tablas de turnos y de asignaciones
+ * las crea la migración 0012; si se despliega el Worker sin aplicar la
+ * migración, CADA consulta a esas tablas revienta con "no such table" y, como
+ * estaban en el camino de "/locations", eso tiraba abajo el POS y el
+ * inventario de todos los cajeros a la vez. Un POS vacío con el mensaje "no
+ * hay productos" hace pensar que faltan productos, y no es eso.
+ *
+ * Se comprueba UNA vez por petición y se cachea. Sale cara solo si la tabla
+ * no existe, y cuando la migración se aplica ya no se vuelve a pagar.
+ */
+let turnosDisponibles: boolean | null = null;
+
+export async function turnosDisponiblesEn(db: any): Promise<boolean> {
+  if (turnosDisponibles !== null) return turnosDisponibles;
+  try {
+    await db.select().from(schema.shifts).limit(1);
+    turnosDisponibles = true;
+  } catch {
+    turnosDisponibles = false;
+    console.error(
+      "[aviso] La tabla 'shifts' no existe. Aplica las migraciones de D1 " +
+      "(npx wrangler d1 migrations apply cubagest-db --remote) antes de usar turnos."
+    );
+  }
+  return turnosDisponibles;
+}
+
+/**
  * Las cajas que puede abrir ESTE usuario.
  *
  * Antes esto era "la caja cuyo ownerUserId es su id": un cajero, una caja. Con
@@ -91,6 +121,7 @@ export async function getCajaLocationForUser(db: DB, companyId: string, userId: 
  * El almacén no se asigna: es de la empresa.
  */
 export async function getCajasAsignadas(db: DB, companyId: string, userId: string) {
+  if (!(await turnosDisponiblesEn(db))) return [];
   const rows = await db.select({ id: schema.inventoryLocations.id, name: schema.inventoryLocations.name, type: schema.inventoryLocations.type, active: schema.inventoryLocations.active })
     .from(schema.locationAssignments)
     .innerJoin(schema.inventoryLocations, eq(schema.locationAssignments.locationId, schema.inventoryLocations.id))
@@ -133,6 +164,7 @@ export async function resolveOwnLocation(db: DB, auth: AuthContext) {
 
 /** El turno abierto de este usuario, con la caja en la que está. */
 export async function getOpenShiftForUser(db: DB, companyId: string, userId: string) {
+  if (!(await turnosDisponiblesEn(db))) return null;
   const row = await db.select().from(schema.shifts)
     .where(and(
       eq(schema.shifts.companyId, companyId),
@@ -147,6 +179,7 @@ export async function getOpenShiftForUser(db: DB, companyId: string, userId: str
 
 /** El turno abierto de ESTA caja, si lo hay. Nadie más puede abrirla mientras tanto. */
 export async function getOpenShiftForLocation(db: DB, companyId: string, locationId: string) {
+  if (!(await turnosDisponiblesEn(db))) return undefined;
   return db.select().from(schema.shifts)
     .where(and(
       eq(schema.shifts.companyId, companyId),

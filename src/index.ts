@@ -23,6 +23,7 @@ import referrals from "./routes/referrals";
 import push from "./routes/push";
 import shifts from "./routes/shifts";
 import cashMovements from "./routes/cashMovements";
+import health from "./routes/health";
 import { cerrarProvisionalesVencidos } from "./routes/closing";
 
 const app = new Hono<{ Bindings: Env }>();
@@ -59,6 +60,7 @@ app.route("/referrals", referrals);
 app.route("/push", push);
 app.route("/shift", shifts);
 app.route("/cash-movements", cashMovements);
+app.route("/health", health);
 
 app.onError((err, c) => {
   console.error(err);

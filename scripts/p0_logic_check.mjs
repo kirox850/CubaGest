@@ -656,7 +656,39 @@ console.log("\n15) Pendiente = todo lo que no cuadra, de dinero Y de mercancía"
     /c\.pendientes\?\.dinero/.test(cc) && /lo dice el\n\s*\*\*servidor/.test(cc) === false);
 }
 
-console.log("\n16) El proxy del frontend reenvía la IP real");
+console.log("\n16) La app no se rompe en silencio cuando falta una migración");
+{
+  const R = (p) => readFileSync(new URL(p, import.meta.url), "utf8");
+  const loc = R("../src/lib/locations.ts");
+  const sh  = R("../src/routes/shifts.ts");
+  const hea = R("../src/routes/health.ts");
+  const pos = R("../../CubaGest-Web/src/screens/POS.tsx");
+  const shf = R("../../CubaGest-Web/src/components/shared/Shift.tsx");
+
+  // El fallo que rompió la plataforma: una tabla que no existe reventaba
+  // /locations, y de ahí el POS y el inventario de todos los cajeros.
+  check("consultar la tabla de turnos no tumba la ruta si no existe",
+    /turnosDisponiblesEn\(db\)\)\) return null;/.test(loc));
+  check("y se dice en el log qué migración falta", /migrations apply/.test(loc));
+  check("/shift/current avisa en vez de fingir que no hay turno",
+    /aviso:/.test(sh) && /migración 0012/.test(sh));
+  check("el POS no puede decir 'no hay productos' cuando el problema es otro",
+    /No se pudo cargar el catálogo/.test(pos) && /No hay productos disponibles en esta caja/.test(pos));
+  check("y el móvil no abre el modal de turno si el servidor avisó",
+    /!avisoTurno/.test(pos));
+
+  check("hay un botón de aceptar, no se arranca el turno de un touch",
+    /onClick=\{\(\) => elegida && empezar\(elegida\)\}/.test(shf) && /Comenzar turno/.test(shf));
+  check("y sin elegir caja el botón está desactivado",
+    /disabled=\{!elegida \|\| eligiendo\}/.test(shf));
+
+  check("existe una ruta que dice qué migraciones faltan",
+    /location_assignments/.test(hea) && /closing_notes/.test(hea) && /migrations apply/.test(hea));
+  check("y no filtra datos de ningún negocio",
+    !/companyId|company_id/.test(hea));
+}
+
+console.log("\n17) El proxy del frontend reenvía la IP real");
 const proxySrc = readFileSync(new URL("../../CubaGest-Web/functions/api/[[path]].ts", import.meta.url), "utf8");
 check("functions/api/[[path]].ts reenvía cf-connecting-ip", /headers\.set\("cf-connecting-ip"/.test(proxySrc));
 check("el proxy corta si el backend se cuelga (AbortController)",

@@ -8,6 +8,7 @@ import { logAudit, getClientIp } from "../lib/audit";
 import { generateUUID } from "../lib/jwt";
 import {
   getCajasAsignadas, getOpenShiftForUser, getOpenShiftForLocation, getActiveCompanyLocation,
+  turnosDisponiblesEn,
 } from "../lib/locations";
 import { dinero } from "../lib/cierreDinero";
 
@@ -32,6 +33,21 @@ shifts.use("*", authMiddleware);
 shifts.get("/current", requireAnyModule("pos", "cierre", "inventario", "facturacion"), async (c) => {
   const db = drizzle(c.env.DB, { schema });
   const auth = c.get("auth");
+  // Si la migración de turnos no está aplicada, se dice con palabras claras en
+  // vez de devolver un "no hay turno" que el móvil no distingue de "todavía no
+  // abriste turno". Una de las dos cosas se arregla abriendo turno; la otra,
+  // no se arregla sola y hay que decirlo.
+  if (!(await turnosDisponiblesEn(db))) {
+    return c.json({
+      ok: true,
+      data: {
+        shift: null,
+        assignedCajas: [],
+        aviso: "La base de datos todavía no tiene las tablas de turnos. Hay que aplicar la migración 0012 antes de usarlos.",
+      },
+    });
+  }
+
   const turno = await getOpenShiftForUser(db, auth.companyId, auth.userId);
   if (!turno) {
     return c.json({ ok: true, data: { shift: null, assignedCajas: auth.role === "cajero" ? await getCajasAsignadas(db, auth.companyId, auth.userId) : [] } });
