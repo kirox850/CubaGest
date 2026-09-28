@@ -23,6 +23,7 @@
 //     sobre-descuentos, doble anulación y doble resolución de un envío.
 
 import { generateUUID } from "./jwt";
+import { ahoraEnSegundos } from "./fechas";
 
 type D1DB = D1Database;
 
@@ -78,7 +79,7 @@ export function ensureLocationStockStmt(
        VALUES (?, ?, ?, 0, ?)
        ON CONFLICT(location_id, product_id) DO NOTHING`
     )
-    .bind(generateUUID(), locationId, productId, Date.now());
+    .bind(generateUUID(), locationId, productId, ahoraEnSegundos());
 }
 
 /**
@@ -95,7 +96,7 @@ export function decrementStockStmt(
           SET qty = ROUND(qty - ?, 3), updated_at = ?
         WHERE location_id = ? AND product_id = ? AND qty >= ?`
     )
-    .bind(qty, Date.now(), locationId, productId, qty);
+    .bind(qty, ahoraEnSegundos(), locationId, productId, qty);
 }
 
 /** Devuelve stock (anulación de venta, ajuste de cierre, entrada). */
@@ -108,7 +109,7 @@ export function incrementStockStmt(
           SET qty = ROUND(qty + ?, 3), updated_at = ?
         WHERE location_id = ? AND product_id = ?`
     )
-    .bind(qty, Date.now(), locationId, productId);
+    .bind(qty, ahoraEnSegundos(), locationId, productId);
 }
 
 /** Fija el stock de una ubicación al valor contado en un cierre. */
@@ -121,7 +122,7 @@ export function setStockStmt(
           SET qty = ?, updated_at = ?
         WHERE location_id = ? AND product_id = ?`
     )
-    .bind(qty, Date.now(), locationId, productId);
+    .bind(qty, ahoraEnSegundos(), locationId, productId);
 }
 
 /** products.stock es SIEMPRE la suma de location_stock (columna calculada). */
@@ -133,7 +134,7 @@ export function recomputeProductStockStmt(db: D1DB, productId: string): D1Prepar
               updated_at = ?
         WHERE id = ?`
     )
-    .bind(productId, Date.now(), productId);
+    .bind(productId, ahoraEnSegundos(), productId);
 }
 
 /** Movimiento de inventario con la ubicación donde ocurrió (columna 0007). */
@@ -156,7 +157,7 @@ export function stockMovementStmt(
     )
     .bind(
       generateUUID(), row.companyId, row.productId, row.userId, row.locationId,
-      row.type, row.qty, row.reason, Date.now()
+      row.type, row.qty, row.reason, ahoraEnSegundos()
     );
 }
 
@@ -207,6 +208,6 @@ export function auditStmt(
     )
     .bind(
       generateUUID(), row.companyId, row.userId, row.action, row.entity,
-      row.entityId ?? null, detail, row.ip ?? null, Date.now()
+      row.entityId ?? null, detail, row.ip ?? null, ahoraEnSegundos()
     );
 }

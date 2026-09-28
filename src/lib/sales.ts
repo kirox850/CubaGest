@@ -16,6 +16,7 @@ import { drizzle } from "drizzle-orm/d1";
 import * as schema from "../db/schema";
 import type { AuthContext } from "../middleware/auth";
 import { generateUUID } from "./jwt";
+import { segundos, ahoraEnSegundos } from "./fechas";
 import { nextInvoiceNumber } from "./invoiceNumber";
 import { PLAN_LIMITS } from "../middleware/plans";
 import { getAllowedCurrencies } from "./companySettings";
@@ -425,8 +426,8 @@ export async function createSale(
       clientId || null,
       // synced_at = CUÁNDO LLEGÓ (diagnóstico). created_at = CUÁNDO SE VENDIÓ
       // (contabilidad). Son cosas distintas y por eso son dos columnas.
-      input.synced ? now.getTime() : null,
-      soldAt.getTime()
+      input.synced ? ahoraEnSegundos() : null,
+      segundos(soldAt)
     )
   );
 

@@ -422,14 +422,14 @@ console.log("\n11) Fechas de venta: la hora real, no la de llegada");
     !/unixepoch\(\)/.test(batchSrc), "quedan: " + (batchSrc.match(/unixepoch\(\)/g) || []).length);
   check("las transferencias tampoco", !/unixepoch\(\)/.test(
     readFileSync(new URL("../src/lib/locations.ts", import.meta.url), "utf8")));
-  check("la venta guarda created_at en milisegundos",
-    /created_at\)\n\s*VALUES \(.*\?\)/.test(salesSrc) && /soldAt\.getTime\(\)/.test(salesSrc));
+  check("la venta guarda created_at en SEGUNDOS, como las columnas del esquema",
+    /created_at\)\n\s*VALUES \(.*\?\)/.test(salesSrc) && /segundos\(soldAt\)/.test(salesSrc));
   check("y usa el momento en que se VENDIÓ, no el de llegada",
     /new Date\(input\.offlineTimestamp\)/.test(salesSrc) && /soldAt = typeof input\.offlineTimestamp/.test(salesSrc));
   check("el día contable sigue a la venta, no a la sincronización",
     /saleDate = soldAt\.toISOString\(\)/.test(salesSrc));
   check("synced_at guarda aparte cuándo llegó (diagnóstico, no contabilidad)",
-    /input\.synced \? now\.getTime\(\) : null/.test(salesSrc));
+    /input\.synced \? ahoraEnSegundos\(\) : null/.test(salesSrc));
 
   // La reparación de lo ya guardado.
   const mig = readFileSync(new URL("../migrations/0010_sale_dates_ms.sql", import.meta.url), "utf8");
@@ -554,8 +554,12 @@ console.log("\n14) El diseño de cierres: dinero, movimientos y provisional");
   const cc  = R("../../CubaGest-Web/src/screens/CierreCaja.tsx");
   const dc  = R("../../CubaGest-Web/src/components/shared/DineroCierre.tsx");
 
-  check("el período de los cierres viejos se arregla (se guardaba en segundos)",
-    /period_start = period_start \* 1000/.test(m13) && /periodStart\.getTime\(\), periodEnd\.getTime\(\)/.test(clo));
+  // La 0013 multiplicaba por 1000 para "arreglar" cierres que se creían mal.
+  // Estaba arreglando la dirección equivocada: el código guardaba
+  // milisegundos en columnas que Drizzle lee en segundos. Ahora el código
+  // escribe segundos y la reparación apunta al otro lado.
+  check("el cierre escribe el período en segundos, no en milisegundos",
+    /segundos\(periodStart\), segundos\(periodEnd\)/.test(clo));
   const cloCodigo = clo.replace(/\/\/.*$/gm, "").replace(/\*\*[\s\S]*?\*\//g, "");
   check("el conteo ya no pisa el stock: ajusta por diferencia",
     !/setStockStmt/.test(cloCodigo) && /incrementStockStmt/.test(cloCodigo) && /decrementStockStmt/.test(cloCodigo));
@@ -589,7 +593,7 @@ console.log("\n14) El diseño de cierres: dinero, movimientos y provisional");
 
   // La ventana de 20 horas corre desde el CONTEO, no desde la sincronización.
   check("la ventana corre desde la hora del conteo, no de la subida",
-    /VENTANA_PROVISIONAL_HORAS = 20/.test(din) && /body\.countedAt/.test(clo) && /countedAt\.getTime\(\)/.test(clo));
+    /VENTANA_PROVISIONAL_HORAS = 20/.test(din) && /body\.countedAt/.test(clo) && /segundos\(countedAt\)/.test(clo));
   check("y sin conexión el móvil manda esa hora de verdad",
     /countedAt: new Date\(c\.timestamp\)\.toISOString\(\)/.test(R("../../CubaGest-Web/src/App.tsx")));
   check("los provisionales vencidos se cierran solos, aunque nadie mire la app",
@@ -824,7 +828,53 @@ console.log("\n20) El servidor va antes que el disco local");
     /[Ss]in la cola local se ven igual las facturas/.test(fac));
 }
 
-console.log("\n21) El proxy del frontend reenvía la IP real");
+console.log("\n21) Las fechas se guardan en SEGUNDOS, como las lee Drizzle");
+{
+  const R = (p) => readFileSync(new URL(p, import.meta.url), "utf8");
+  const fe = R("../src/lib/fechas.ts");
+
+  // En SQLite, integer({mode:"timestamp"}) de Drizzle es SEGUNDOS:
+  //   mapToDriverValue:  Math.floor(value.getTime() / 1e3)
+  //   mapFromDriverValue: new Date(value * 1e3)
+  // El esquema entero y todas las migraciones (unixepoch()) usan segundos.
+  // Cuando el SQL a mano guardaba milisegundos, cada fila quedaba mil veces en
+  // el futuro: el cierre veía cero ventas, las fechas salían en el año 58709
+  // y la ventana de 20 horas decía 496 894 297.
+  check("existe el helper y divide por 1000",
+    /export function segundos/.test(fe) && /Math\.floor\(ms \/ 1000\)/.test(fe));
+  check("y hay un atajo para el instante actual",
+    /export function ahoraEnSegundos/.test(fe) && /Math\.floor\(Date\.now\(\) \/ 1000\)/.test(fe));
+
+  // Ningún .bind() puede guardar un instante en milisegundos.
+  const fsp = await import("node:fs");
+  const path = await import("node:path");
+  const ra = new URL("../src/", import.meta.url).pathname;
+  const malos = [];
+  const recorrer = (dir) => {
+    for (const e of fsp.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) { recorrer(p); continue; }
+      if (!p.endsWith(".ts")) continue;
+      const txt = fsp.readFileSync(p, "utf8").replace(/\/\/.*$/gm, "");
+      // Cada bloque .bind( ... ) hasta su cierre
+      for (const m of txt.matchAll(/\.bind\(([\s\S]{0,600}?)\n\s*\)/g)) {
+        const bloque = m[1];
+        const usaMilis = /Date\.now\(\)|\.getTime\(\)/.test(bloque);
+        const divide = /\/\s*1000|ahoraEnSegundos\(\)|segundos\(/.test(bloque);
+        if (usaMilis && !divide) malos.push(path.basename(p));
+      }
+    }
+  };
+  recorrer(ra);
+  check(`ningún .bind() guarda un instante en milisegundos`, malos.length === 0);
+  if (malos.length) console.log("       en: " + [...new Set(malos)].join(", "));
+
+  // Y el comentario que explica por qué, para que nadie lo "simplifique".
+  check("el motivo está escrito junto al helper",
+    /significa SEGUNDOS/.test(fe) && /año 58709/.test(fe));
+}
+
+console.log("\n22) El proxy del frontend reenvía la IP real");
 const proxySrc = readFileSync(new URL("../../CubaGest-Web/functions/api/[[path]].ts", import.meta.url), "utf8");
 check("functions/api/[[path]].ts reenvía cf-connecting-ip", /headers\.set\("cf-connecting-ip"/.test(proxySrc));
 check("el proxy corta si el backend se cuelga (AbortController)",

@@ -12,6 +12,7 @@ import {
   stockMovementStmt,
   runBatch,
 } from "./batch";
+import { ahoraEnSegundos } from "./fechas";
 
 type DB = ReturnType<typeof drizzle>;
 
@@ -359,7 +360,7 @@ export async function buildReturnAllStockStatements(
     env.DB.prepare(
       `INSERT INTO stock_transfers (id, company_id, from_location_id, to_location_id, requested_by_id, resolved_by_id, status, notes, resolved_at, created_at)
        VALUES (?, ?, ?, ?, ?, ?, 'aprobado', ?, ?, ?)`
-    ).bind(transferId, companyId, cajaLocationId, almacenLocationId, byUserId, byUserId, reason, Date.now(), Date.now()),
+    ).bind(transferId, companyId, cajaLocationId, almacenLocationId, byUserId, byUserId, reason, ahoraEnSegundos(), ahoraEnSegundos()),
   ];
 
   for (const row of withStock) {

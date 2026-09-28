@@ -13,6 +13,7 @@ import {
   lineasMercaderiaSinCuadrar, todoCuadra, MERCANCIA_TOLERANCIA,
   VENTANA_PROVISIONAL_HORAS,
 } from "../lib/cierreDinero";
+import { segundos, ahoraEnSegundos } from "../lib/fechas";
 import {
   auditStmt,
   runBatch,
@@ -491,7 +492,7 @@ closing.post("/confirm", requireModule("cierre"), async (c) => {
        VALUES (?, ?, ?, ?, 'cierre', ?, ?, ?)`
     ).bind(
       closingReadingId, auth.companyId, locationId, auth.userId,
-      "Generada automaticamente al cierre", JSON.stringify(closingReadingItems), Date.now()
+      "Generada automaticamente al cierre", JSON.stringify(closingReadingItems), ahoraEnSegundos()
     ),
     c.env.DB.prepare(
       `INSERT INTO cash_closings (id, company_id, location_id, closed_by_id, initial_reading_id,
@@ -508,7 +509,7 @@ closing.post("/confirm", requireModule("cierre"), async (c) => {
       // { mode: "timestamp" }, que lee milisegundos. Antes se guardaban en
       // segundos (unixepoch) y todo cierre histórico salía fechado en 1970.
       // La migración 0013 repara los que ya estaban mal.
-      periodStart.getTime(), periodEnd.getTime(),
+      segundos(periodStart), segundos(periodEnd),
       totalSales, totalIncomeR, incomeEfectivoR, incomeTransferenciaR,
       JSON.stringify(closingItems),
       JSON.stringify(conciliacion.base), JSON.stringify(conciliacion.contado),
@@ -520,11 +521,11 @@ closing.post("/confirm", requireModule("cierre"), async (c) => {
       // Si el dinero no cuadra, el cierre queda PROVISIONAL: existe, no se
       // pierde, pero espera una explicación. Si cuadra, se cierra de una vez.
       quedaAlgo ? "provisional" : "cerrado",
-      countedAt.getTime(),
-      quedaAlgo ? venceProvisional(countedAt, new Date()).getTime() : null,
+      segundos(countedAt),
+      quedaAlgo ? segundos(venceProvisional(countedAt, new Date())) : null,
       shiftId,
       (body.notes || "").trim() || null,
-      Date.now()
+      ahoraEnSegundos()
     ),
 
   ];
