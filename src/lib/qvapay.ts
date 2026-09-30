@@ -31,6 +31,17 @@ async function qvapayRequest(env: Env, path: string, body: Record<string, unknow
   if (!res.ok) {
     throw new QvaPayError((data as any)?.error || `Error QvaPay (${res.status})`, res.status);
   }
+  // QvaPay puede responder HTTP 200 con success:false: la petición llegó, pero
+  // la operación fue RECHAZADA (sin saldo, usuario no autorizado, etc.).
+  // Tratarlo como éxito extendía el plan gratis. Se lanza con status 400 a
+  // propósito: así classifyChargeFailure() (subscriptions.ts) lo clasifica como
+  // "rejected" (definitivo, no reintentable), que es lo que es.
+  //
+  // La forma es `success === false` y no `!success`: /v2/authorize_payments
+  // responde { message, url } SIN campo success y no puede romperse.
+  if (data && typeof data === "object" && (data as any).success === false) {
+    throw new QvaPayError((data as any)?.message || "QvaPay rechazó la operación", 400);
+  }
   return data as any;
 }
 

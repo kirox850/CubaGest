@@ -1,20 +1,10 @@
 -- El diseño de cierres completo: dinero, movimientos, y cierre provisional.
 --
 -- Hasta aquí el cierre solo reconciliaba INVENTARIO: el dinero se registraba
--- pero nunca se contaba. Y el periodo de cada cierre se guardaba en segundos
--- mientras el código lo leía como milisegundos, así que todo cierre histórico
--- tenía fecha de 1970 y su período era incalculable.
-
--- ── Arreglar el período de los cierres ya hechos ────────────────────────────
--- Mismo criterio que en 0010 para las ventas: si el valor parece segundos, es
--- que lo está, y se multiplica por 1000 para dejarlo en milisegundos.
-UPDATE cash_closings
-   SET period_start = period_start * 1000
- WHERE period_start IS NOT NULL AND period_start > 0 AND period_start < 100000000000;
-
-UPDATE cash_closings
-   SET period_end = period_end * 1000
- WHERE period_end IS NOT NULL AND period_end > 0 AND period_end < 100000000000;
+-- pero nunca se contaba. (Hubo un intento de "arreglar" aquí el período de los
+-- cierres ya hechos con un UPDATE; se eliminó — ver la nota histórica de 0010:
+-- ninguna migración corrige fechas, las fechas las escribe correctas el código,
+-- y la base se limpia antes de lanzar a producción.)
 
 -- ── Dinero en varias monedas ────────────────────────────────────────────────
 -- Cada cantidad se guarda EN SU MONEDA, en un objeto JSON: {"CUP":1200,"USD":20}.

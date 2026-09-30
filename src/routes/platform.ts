@@ -27,6 +27,18 @@ const PLAN_PRICE_USD = PLAN_PRICES;
 
 const platform = new Hono<{ Bindings: Env }>();
 
+// ── Empresa para el panel: la fila SIN el secreto de cobro ──────────────────
+// `qvapayAuthSecret` es la credencial que la API de QvaPay devuelve en el
+// callback y la que permite COBRARLE a esa empresa. Tres rutas de aquí abajo
+// devolvían la fila entera, secreto incluido. El panel nunca lo leyó (solo
+// distingue "QvaPay autorizado / NO autorizado"), así que se corta aquí: el
+// detalle, el cambio de plan y el pago manual siguen devolviendo TODO lo
+// demás tal cual, pero el secreto no sale de la API por ningún camino.
+function companyForPanel(co: typeof schema.companies.$inferSelect) {
+  const { qvapayAuthSecret: _omit, ...safe } = co;
+  return safe;
+}
+
 // ── Contexto del admin de plataforma ─────────────────────────────────────────
 interface PlatformContext { adminId: string; email: string }
 
@@ -182,7 +194,7 @@ platform.get("/companies/:id", async (c) => {
   }).from(schema.sales).where(eq(schema.sales.companyId, id)).get();
   return c.json({
     ok: true, data: {
-      company: co, users,
+      company: companyForPanel(co), users,
       salesTotal: salesAgg?.count || 0,
       lastSaleDate: salesAgg?.last || null,
       qvapayAuthorized: !!co.qvapayAuthorized,
@@ -216,7 +228,7 @@ platform.post("/companies/:id/plan", async (c) => {
   await logPlatform(c.env, auth.adminId, "platform.plan.change", "company", id,
     { before: { plan: co.plan, planExpiry: co.planExpiry }, after: updates }, c.req.header("CF-Connecting-IP") || "");
   const updated = await db.select().from(schema.companies).where(eq(schema.companies.id, id)).get();
-  return c.json({ ok: true, data: updated });
+  return c.json({ ok: true, data: companyForPanel(updated!) });
 });
 
 // ── Suspender / reactivar empresa completa ───────────────────────────────────
@@ -257,7 +269,7 @@ platform.post("/companies/:id/payment", async (c) => {
   await logPlatform(c.env, auth.adminId, "platform.payment.manual", "company", id,
     { months, previousExpiry: co.planExpiry, newExpiry: base.toISOString() }, c.req.header("CF-Connecting-IP") || "");
   const updated = await db.select().from(schema.companies).where(eq(schema.companies.id, id)).get();
-  return c.json({ ok: true, data: updated });
+  return c.json({ ok: true, data: companyForPanel(updated!) });
 });
 
 // ── Notas internas ───────────────────────────────────────────────────────────

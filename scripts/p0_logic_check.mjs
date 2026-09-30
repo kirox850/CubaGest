@@ -431,12 +431,18 @@ console.log("\n11) Fechas de venta: la hora real, no la de llegada");
   check("synced_at guarda aparte cuándo llegó (diagnóstico, no contabilidad)",
     /input\.synced \? ahoraEnSegundos\(\) : null/.test(salesSrc));
 
-  // La reparación de lo ya guardado.
+  // Las filas viejas NO se reparan: la base se limpia antes de lanzar a
+  // producción, y el intento de reparación (`* 1000`) tenía la dirección
+  // equivocada — multiplicaba filas CORRECTAS hacia el futuro. La guardia de
+  // la sección 21 (más abajo) vela porque ninguna migración vuelva a tocar
+  // fechas; aquí se comprueba que 0010 quedó neutralizado con su nota.
   const mig = readFileSync(new URL("../migrations/0010_sale_dates_ms.sql", import.meta.url), "utf8");
-  check("hay migración que arregla las ventas ya fechadas en 1970",
-    /UPDATE sales\s+SET created_at = created_at \* 1000/.test(mig));
-  check("y solo toca valores que son segundos (no toca lo ya correcto)",
-    /created_at < 100000000000/.test(mig));
+  // Solo SQL real, no comentarios: el texto de la nota menciona "UPDATE".
+  const migSinComentarios = mig.replace(/^--.*$/gm, "");
+  check("0010 no contiene ningún UPDATE (no corrige fechas, y con razón)",
+    !/UPDATE/.test(migSinComentarios));
+  check("y explica la decisión para que no se reintente",
+    /NO toca ninguna fecha/.test(mig) || /ya NO toca ninguna fecha/.test(mig));
 
   // ── Orden de la sincronización ──
   const ventas = appSrc.indexOf("/sales/sync");
@@ -872,6 +878,23 @@ console.log("\n21) Las fechas se guardan en SEGUNDOS, como las lee Drizzle");
   // Y el comentario que explica por qué, para que nadie lo "simplifique".
   check("el motivo está escrito junto al helper",
     /significa SEGUNDOS/.test(fe) && /año 58709/.test(fe));
+
+  // Ninguna migración "corrige" fechas: la única dirección válida para una
+  // columna en segundos es no tocarla. Hubo un `* 1000` aquí (0010 y 0013)
+  // que multiplicaba filas CORRECTAS hacia el año 55734; se eliminó (2026-09-29)
+  // porque la base se limpia antes de lanzar y el código ya escribe bien.
+  // Esta guardia evita que vuelva a aparecer con otro nombre.
+  const fsp2 = await import("node:fs");
+  const migDir = new URL("../migrations/", import.meta.url).pathname;
+  const malas = [];
+  for (const f of fsp2.readdirSync(migDir)) {
+    if (!f.endsWith(".sql")) continue;
+    const sql = fsp2.readFileSync(migDir + f, "utf8");
+    // UPDATE ... SET <col> = <col> * 1000  (reparación de timestamps)
+    if (/UPDATE[\s\S]{0,200}?\*\s*1000/.test(sql)) malas.push(f);
+  }
+  check("ninguna migración multiplica timestamps por 1000", malas.length === 0);
+  if (malas.length) console.log("       en: " + malas.join(", "));
 }
 
 console.log("\n22) El proxy del frontend reenvía la IP real");
@@ -880,6 +903,34 @@ check("functions/api/[[path]].ts reenvía cf-connecting-ip", /headers\.set\("cf-
 check("el proxy corta si el backend se cuelga (AbortController)",
   /new AbortController\(\)/.test(proxySrc) && /controller\.abort\(\)/.test(proxySrc));
 check("y devuelve un error claro en vez de colgarse", /504/.test(proxySrc) && /tardó demasiado/.test(proxySrc));
+
+console.log("\n23) El secreto de cobro de QvaPay no sale de la API");
+{
+  const platformSrc = readFileSync(new URL("../src/routes/platform.ts", import.meta.url), "utf8");
+  // Toda fila de company que el panel devuelve pasa por companyForPanel,
+  // que recorta qvapayAuthSecret. Sin el helper, un `company: co` o
+  // `data: updated` crudo volvería a exponer la credencial de cobro.
+  check("existe el recorte y menciona por qué",
+    /function companyForPanel/.test(platformSrc) && /qvapayAuthSecret/.test(platformSrc));
+  check("el detalle de empresa pasa por el recorte",
+    /company: companyForPanel\(co\)/.test(platformSrc));
+  const cambios = platformSrc.match(/data: companyForPanel\(updated!\)/g) || [];
+  check("cambio de plan y pago manual también (2 sitios)", cambios.length === 2);
+  check("no queda ningún retorno crudo de la fila",
+    !/company: co[,}]/.test(platformSrc) && !/data: updated[,}]/.test(platformSrc));
+}
+
+console.log("\n24) QvaPay 200 con success:false es un rechazo, no un éxito");
+{
+  const qv = readFileSync(new URL("../src/lib/qvapay.ts", import.meta.url), "utf8");
+  check("qvapayRequest rechaza success === false",
+    /success === false/.test(qv) && /RECHAZADA/.test(qv));
+  // Con status 400, classifyChargeFailure debe clasificarlo como definitivo.
+  const rech = classifyChargeFailure(Object.assign(new Error("QvaPay rechazó la operación"), { status: 400 }));
+  check("un 400 de QvaPay clasifica como rejected (no retry_later)", rech === "rejected");
+  const rl = classifyChargeFailure(Object.assign(new Error("lento"), { status: 429 }));
+  check("un 429 sigue siendo retry_later", rl === "retry_later");
+}
 
 console.log(`\n${fail === 0 ? "✅" : "❌"} resultado: ${pass} ok, ${fail} fallos`);
 process.exit(fail === 0 ? 0 : 1);
