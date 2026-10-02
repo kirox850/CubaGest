@@ -25,6 +25,7 @@ import shifts from "./routes/shifts";
 import cashMovements from "./routes/cashMovements";
 import health from "./routes/health";
 import { cerrarProvisionalesVencidos } from "./routes/closing";
+import { reconciliarEmpresa } from "./lib/turnReconciler";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -87,6 +88,16 @@ export default {
       const db = drizzle(env.DB, { schema });
       const n = await cerrarProvisionalesVencidos(db, env);
       if (n) console.log(`cerrados ${n} cierre(s) provisional(es) vencido(s)`);
+    })());
+    // Barrido de seguridad de la cadena de turnos. El disparo de verdad es cada
+    // vez que entra una venta (routes/sync.ts); esto recoge lo que se quedó a
+    // medias: un eslabón que faltaba, un cierre que se subió después y no llegó a
+    // compararse. Sin esto, una comparación diferida se quedaría pendiente para
+    // siempre y el turno siguiente heredaría el descuadre sin que nadie lo dijera.
+    ctx.waitUntil((async () => {
+      const db = drizzle(env.DB, { schema });
+      const r = await reconciliarEmpresa(db);
+      if (r.different) console.log(`cadena de turnos: ${r.different} diferencia(s) entre turnos`);
     })());
   },
 };

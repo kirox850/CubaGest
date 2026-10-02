@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { eq, and } from "drizzle-orm";
+import { eq, and, desc } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import * as schema from "../db/schema";
 import { authMiddleware } from "../middleware/auth";
@@ -7,7 +7,7 @@ import { requireModule, requireAnyModule, requireRole } from "../middleware/role
 import { logAudit, getClientIp } from "../lib/audit";
 import { generateUUID } from "../lib/jwt";
 import {
-  getCajasAsignadas, getOpenShiftForUser, getOpenShiftForLocation, getActiveCompanyLocation,
+  getCajasAsignadas, getOpenShiftForUser, getActiveCompanyLocation,
   turnosDisponiblesEn,
 } from "../lib/locations";
 import { dinero } from "../lib/cierreDinero";
@@ -96,15 +96,20 @@ shifts.post("/start", requireModule("pos"), async (c) => {
     return c.json({ ok: false, error: "Esa caja no existe o está desactivada" }, 404);
   }
 
-  // Una caja con turno abierto no se puede tomar. Sin esto, dos personas
-  // podrían contar la misma caja a la vez y el inventario quedaría contado dos
-  // veces.
-  const ocupada = await getOpenShiftForLocation(db, auth.companyId, locationId);
-  if (ocupada) {
-    const otro = await db.select({ name: schema.users.name }).from(schema.users)
-      .where(eq(schema.users.id, ocupada.userId)).get();
-    return c.json({ ok: false, error: `Esa caja ya está en uso${otro?.name ? ` por ${otro.name}` : ""}. Ciérrale el turno o usa otra caja.` }, 409);
-  }
+  // EL TURNO ES DE LA PERSONA; LA CAJA ES DEL NEGOCIO.
+  //
+  // Antes una caja con turno abierto no se podía tomar, y con razón: si un
+  // cierre se quedaba en la cola sin conexión, el turno seguía abierto y el
+  // negocio quedaba parado hasta que volviera la red. Eso no puede ser.
+  //
+  // Ahora dos personas pueden tener turno abierto en la MISMA caja, y cada turno
+  // lleva su propia lectura de apertura y su propio cierre. Que se counted dos
+  // veces ya no es un problema porque la cadena de turnos (migración 0015) separa
+  // el stock por hora de negocio: el segundo conteo no vuelve a descontar lo que
+  // el primero ya tenía dentro.
+  //
+  // Lo que NO se permite sigue siendo lo importante: una misma persona con dos
+  // turnos abiertos a la vez, que sí sería un error de verdad.
 
   const yaTengo = await getOpenShiftForUser(db, auth.companyId, auth.userId);
   if (yaTengo) {
@@ -172,6 +177,45 @@ shifts.post("/end", requireAnyModule("pos", "cierre"), async (c) => {
   const auth = c.get("auth");
   const turno = await getOpenShiftForUser(db, auth.companyId, auth.userId);
   if (!turno) return c.json({ ok: false, error: "No tienes ningún turno abierto" }, 400);
+
+  // ── Un turno no se cierra sin cierre ──
+  // Antes bastaba con pulsar "terminar turno" y el turno se cerraba solo. Eso
+  // dejaba un turno en la cadena sin foto de cierre: el siguiente cajero abría
+  // contra la lectura de apertura de DOS turnos antes y todo lo que pasó entre
+  // medio se le endosaba a él.
+  //
+  // Ahora el cierre es lo que cierra el turno, en el mismo lote (ver
+  // routes/closing.ts /confirm). Si el turno tiene cierre, aquí solo se confirma
+  // el estado. Si no lo tiene, se dice qué hacer en vez de dejar un hueco.
+  const yaCerrado = await db.select({ id: schema.cashClosings.id }).from(schema.cashClosings)
+    .where(and(
+      eq(schema.cashClosings.companyId, auth.companyId),
+      eq(schema.cashClosings.locationId, turno.locationId),
+    )).orderBy(desc(schema.cashClosings.countedAt)).get();
+
+  const tieneLectura = turno.openingReadingId
+    || await db.select({ id: schema.inventoryReadings.id }).from(schema.inventoryReadings)
+      .where(and(
+        eq(schema.inventoryReadings.companyId, auth.companyId),
+        eq(schema.inventoryReadings.locationId, turno.locationId),
+        eq(schema.inventoryReadings.type, "apertura"),
+      )).orderBy(desc(schema.inventoryReadings.createdAt)).get();
+
+  if (!tieneLectura) {
+    return c.json({
+      ok: false,
+      error: "Primero abre el turno: haz el conteo de apertura. Sin lectura no hay con qué cerrar.",
+      code: "SHIFT_WITHOUT_READING",
+    }, 409);
+  }
+
+  if (!yaCerrado) {
+    return c.json({
+      ok: false,
+      error: "No puedes terminar el turno sin hacer el cierre. Al confirmar el cierre, el turno se cierra solo.",
+      code: "SHIFT_WITHOUT_CLOSING",
+    }, 409);
+  }
 
   await db.update(schema.shifts)
     .set({ status: "cerrado", endedAt: new Date() })

@@ -21,6 +21,7 @@ import { nextInvoiceNumber } from "./invoiceNumber";
 import { PLAN_LIMITS } from "../middleware/plans";
 import { getAllowedCurrencies } from "./companySettings";
 import { computeDiscountAmount, isDiscountAvailable, type DiscountRow } from "./discountRules";
+import { debeAplicarAlStock } from "./turnChain";
 import {
   ensureLocationStockStmt,
   decrementStockStmt,
@@ -90,6 +91,14 @@ export interface SaleSuccess {
   duplicate: boolean;
   sale: typeof schema.sales.$inferSelect;
   items: (typeof schema.saleItems.$inferSelect)[];
+  /**
+   * Si esta venta movió el stock. `false` significa que su hora de negocio es
+   * anterior a la última foto de la caja: ya venía dentro del número que contó
+   * el cajero, y aplicarla sería descontarlo dos veces. No es un error.
+   */
+  stockAjustado?: boolean;
+  /** Por qué no se ajustó, para poder explicárselo a quien vende. */
+  motivoStock?: string;
 }
 
 export type CreateSaleResult = SaleSuccess | SaleFailure;
@@ -407,9 +416,21 @@ export async function createSale(
     ? ` (registrada offline el ${new Date(input.offlineTimestamp).toISOString()})`
     : "";
 
+  // Regla de cadena de turnos (F0): una venta cuya hora de negocio sea anterior
+  // a la última foto de esta caja YA está dentro del número que contó el cajero.
+  // Aplicarla sería descontar dos veces lo mismo. La venta se registra igual —entra
+  // en facturación e historia—, lo único que no hace es volver a mover el stock.
+  //
+  // `soldAt` es la hora del POS (la de `offlineTimestamp` cuando viene de una
+  // venta sin conexión), no la de ahora: comparar contra la hora de llegada
+  // haría que toda venta tardía se aplicara y volvería el problema.
+  const { aplica: aplicaAlStock, motivo: motivoStock } = await debeAplicarAlStock(db, location.id, soldAt);
+
   // 9) El batch: una transacción. Cualquier fallo revierte TODO.
   const stmts: D1PreparedStatement[] = [];
-  for (const l of lines) stmts.push(ensureLocationStockStmt(env.DB, location.id, l.product.id));
+  if (aplicaAlStock) {
+    for (const l of lines) stmts.push(ensureLocationStockStmt(env.DB, location.id, l.product.id));
+  }
 
   stmts.push(
     env.DB.prepare(
@@ -444,7 +465,7 @@ export async function createSale(
   }
 
   for (const l of lines) {
-    stmts.push(decrementStockStmt(env.DB, location.id, l.product.id, l.qty));
+    if (aplicaAlStock) stmts.push(decrementStockStmt(env.DB, location.id, l.product.id, l.qty));
     stmts.push(
       stockMovementStmt(env.DB, {
         companyId: auth.companyId,
@@ -512,7 +533,14 @@ export async function createSale(
 
   const loaded = await loadSaleWithItems(db, auth.companyId, saleId);
   if (!loaded) return fail(500, "La venta se guardó pero no se pudo leer. Reintenta la sincronización.", "SALE_READ_BACK", true);
-  return { ok: true, duplicate: false, sale: loaded.sale, items: loaded.items };
+  // `stockAjustado: false` no es un fallo: es una venta que ya venía contada en
+  // el conteo de la caja. Se devuelve para que el cliente pueda decirlo en vez de
+  // dejar que el cajero piense que se perdió merchandise.
+  return {
+    ok: true, duplicate: false, sale: loaded.sale, items: loaded.items,
+    stockAjustado: aplicaAlStock,
+    motivoStock: motivoStock || undefined,
+  };
 }
 
 // ── Anulación ────────────────────────────────────────────────────────────────
@@ -568,12 +596,19 @@ export async function voidSale(
       .bind(sale.id),
   ];
 
+  // La anulación es la misma historia del revés. Si esta venta NO llegó a
+  // descontar el stock porque ya venía dentro del conteo (regla F0), anularla no
+  // puede devolver mercancía que nunca se quitó: sería inventar 10 unidades.
+  const { aplica: anularAjusta } = await debeAplicarAlStock(db, locationId, sale.createdAt ?? new Date());
+
   for (const item of items) {
     if (!item.productId) continue;
     const qty = Number(item.qty);
     if (!Number.isFinite(qty) || qty <= 0) continue;
-    stmts.push(ensureLocationStockStmt(env.DB, locationId, item.productId));
-    stmts.push(incrementStockStmtPublic(env.DB, locationId, item.productId, qty));
+    if (anularAjusta) {
+      stmts.push(ensureLocationStockStmt(env.DB, locationId, item.productId));
+      stmts.push(incrementStockStmtPublic(env.DB, locationId, item.productId, qty));
+    }
     stmts.push(
       stockMovementStmt(env.DB, {
         companyId: auth.companyId,

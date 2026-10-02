@@ -6,6 +6,7 @@ import { requireModule } from "../middleware/roles";
 import { getClientIp } from "../lib/audit";
 import { resolveSaleLocation, createSale, validateClientSaleId, MAX_SYNC_BATCH, type SaleLineInput } from "../lib/sales";
 import { resolveOwnLocation } from "../lib/locations";
+import { reconciliarCaja } from "../lib/turnReconciler";
 
 const sync = new Hono<{ Bindings: Env }>();
 
@@ -189,6 +190,29 @@ sync.post("/", requireModule("pos"), async (c) => {
   }
 
   const synced = results.filter((r) => r.status === "synced").length;
+
+  // ── Reconciliar la cadena de turnos (F6) ──
+  // Este es el disparo PRINCIPAL, no el reloj. Si acaba de entrar una venta de
+  // ayer, el panorama de esa caja cambia AHORA: esperar al barrido de las 5 horas
+  // dejaría el stock mal horas. Se hace solo con las cajas que se tocaron, para no
+  // recorrer la empresa entera en cada sincronización.
+  //
+  // No falla la respuesta si aquí hay un problema: las ventas ya están guardadas
+  // y son lo importante. La cadena se vuelve a intentar en el siguiente ciclo.
+  if (synced > 0) {
+    const cajas = new Set<string>();
+    for (const r of results as any[]) {
+      if (r.status === "synced" && r.locationId) cajas.add(String(r.locationId));
+    }
+    for (const caja of cajas) {
+      try {
+        await reconciliarCaja(db, auth.companyId, caja);
+      } catch (e) {
+        console.error("reconciliarCaja falló para", caja, e);
+      }
+    }
+  }
+
   return c.json({ ok: true, data: results, summary: { total: results.length, synced } });
 });
 

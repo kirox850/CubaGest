@@ -141,6 +141,10 @@ export const inventoryLocations = sqliteTable("inventory_locations", {
   // persona). Para una "caja" es el cajero dueño de ese inventario/caja.
   ownerUserId: text("owner_user_id").references(() => users.id, { onDelete: "set null" }),
   active: integer("active", { mode: "boolean" }).notNull().default(true),
+  // Última foto conocida de esta caja: la cantidad contada más lo que pasó
+  // después. Un movimiento cuya hora de negocio sea anterior a esto ya está
+  // dentro del número contado y NO debe volver a aplicarse. Ver migración 0015.
+  lastSnapshotAt: integer("last_snapshot_at", { mode: "timestamp" }),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
 }, (table) => ({
   companyIdx: index("locations_company_idx").on(table.companyId),
@@ -172,6 +176,13 @@ export const shifts = sqliteTable("shifts", {
   endedAt: integer("ended_at", { mode: "timestamp" }),
   status: text("status", { enum: ["abierto", "cerrado"] }).notNull().default("abierto"),
   openingReadingId: text("opening_reading_id").references(() => inventoryReadings.id),
+  // Cierre que cierra este turno. Se rellena cuando el cierre LLEGA al servidor:
+  // si se queda en la cola sin conexión, el turno sigue abierto a propósito.
+  //
+  // SIN `.references()` a propósito: cash_closings ya referencia shifts por
+  // shift_id, y añadir la vuelta crea un ciclo que TypeScript no puede tipar
+  // sin currar. La integridad la garantiza la aplicación en el mismo lote.
+  closingId: text("closing_id"),
   // Con cuánto dinero arrancó la caja, por moneda: {"CUP":5000,"USD":20}.
   // Sin esto no hay forma de saber si un faltante es de este turno o venía
   // de antes — y sin esa diferencia, la conciliación no significa nada.
@@ -181,6 +192,39 @@ export const shifts = sqliteTable("shifts", {
 }, (table) => ({
   byUser: index("shifts_open").on(table.companyId, table.userId, table.status),
   byLocation: index("shifts_location").on(table.companyId, table.locationId, table.startedAt),
+}));
+
+// Comparación entre fotos consecutivas de una caja (plan de cadena, F6).
+//
+// Cada elemento de la cadena (apertura/cierre) se compara contra su vecina
+// INMEDIATA anterior de la MISMA caja. Por eso un eslabón que falta solo difiere
+// su propia comparación entrante: openB2 y closeB1 se comparan entre sí sin que
+// haya llegado closeA1.
+//
+// NO es el estado del cierre. Un cierre provisional sin descuadre explicado y una
+// diferencia entre turnos son cosas distintas, y por eso viven en tablas
+// distintas: confundirlas fue el error que motivó separarlas.
+export const turnReconciliations = sqliteTable("turn_reconciliations", {
+  id: text("id").primaryKey(),
+  companyId: text("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
+  locationId: text("location_id").notNull().references(() => inventoryLocations.id, { onDelete: "cascade" }),
+  prevType: text("prev_type", { enum: ["apertura", "cierre"] }).notNull(),
+  prevId: text("prev_id").notNull(),
+  nextType: text("next_type", { enum: ["apertura", "cierre"] }).notNull(),
+  nextId: text("next_id").notNull(),
+  // pendiente = falta la vecina anterior; conciliado = cuadró;
+  // diferente = hay faltante o sobrante entre esas dos fotos.
+  status: text("status", { enum: ["pendiente", "conciliado", "diferente"] }).notNull().default("pendiente"),
+  diffItems: text("diff_items", { mode: "json" }).notNull().$defaultFn(() => ({})),
+  diffCash: text("diff_cash", { mode: "json" }).notNull().$defaultFn(() => ({})),
+  prevAt: integer("prev_at", { mode: "timestamp" }).notNull(),
+  nextAt: integer("next_at", { mode: "timestamp" }).notNull(),
+  reconciledAt: integer("reconciled_at", { mode: "timestamp" }),
+  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+}, (table) => ({
+  byLocation: index("turn_rec_by_location").on(table.locationId, table.nextAt),
+  byStatus: index("turn_rec_pending").on(table.companyId, table.status),
+  uniquePair: uniqueIndex("turn_rec_unique_pair").on(table.locationId, table.prevType, table.prevId, table.nextType, table.nextId),
 }));
 
 export const locationStock = sqliteTable("location_stock", {
@@ -333,6 +377,13 @@ export const inventoryReadings = sqliteTable("inventory_readings", {
   type: text("type", { enum: ["apertura", "cierre"] }).notNull(),
   notes: text("notes"),
   items: text("items", { mode: "json" }).notNull().$defaultFn(() => []),
+  // De dónde salió cada número de `items`. Sin esto, un descuadre no se puede
+  // atribuir: el cajero puede tener razón en que le dejaron 89 y el sistema no
+  // tiene forma de saber si alguien contó eso o se heredó. Ver migración 0018.
+  origen: text("origen", { enum: ["contado", "heredado"] }).notNull().default("contado"),
+  // Marca las lecturas que abren un turno. El cierre se hace contra la apertura
+  // de SU turno, no contra "la última lectura sin usar".
+  isOpening: integer("is_opening", { mode: "boolean" }).notNull().default(false),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
 });
 
@@ -400,6 +451,11 @@ export const cashMovements = sqliteTable("cash_movements", {
   approvedById: text("approved_by_id").references(() => users.id),
   approvedAt: integer("approved_at", { mode: "timestamp" }),
   decisionNote: text("decision_note"),
+  // CUÁNDO SE REGISTRÓ el movimiento, no cuándo llegó al servidor. Un retiro de
+  // la caja fuerte hecho sin conexión tiene que contar desde el día en que salió
+  // el dinero; con `created_at` se contaría en el periodo equivocado y la
+  // apertura siguiente saltaría un descuadre que no existe. NULL = created_at.
+  businessAt: integer("business_at", { mode: "timestamp" }),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
 }, (table) => ({
   pendingIdx: index("cash_movements_pending").on(table.companyId, table.locationId, table.status),
@@ -545,6 +601,11 @@ export const companySettings = sqliteTable("company_settings", {
   cashToleranceValue: real("cash_tolerance_value").notNull().default(0),
   // Las salidas de dinero de caja se aprueban siempre (admin o contador).
   cashRequireApproval: integer("cash_require_approval", { mode: "boolean" }).notNull().default(true),
+  // Ajuste 2 del plan de cadena de turnos. Por defecto 0 = DESACTIVADO, es decir,
+  // la apertura SE CUENTA. Ponerlo en 1 hace que la apertura copie la foto
+  // anterior: ahorra el conteo pero deja la caja sin verificar en el cambio de
+  // turno, y el error aflora en el cierre siguiente atribuido a otro cajero.
+  openingInheritsPrevious: integer("opening_inherits_previous", { mode: "boolean" }).notNull().default(false),
   updatedAt: integer("updated_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
 });
 

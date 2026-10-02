@@ -3,7 +3,7 @@ import { eq, and, gte, lte, desc, inArray } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import * as schema from "../db/schema";
 import { authMiddleware } from "../middleware/auth";
-import { requireModule, requireRole } from "../middleware/roles";
+import { requireModule } from "../middleware/roles";
 import { generateUUID } from "../lib/jwt";
 import { logAudit, getClientIp } from "../lib/audit";
 import { notify, adminsOf } from "../lib/push";
@@ -14,6 +14,8 @@ import {
   VENTANA_PROVISIONAL_HORAS,
 } from "../lib/cierreDinero";
 import { segundos, ahoraEnSegundos } from "../lib/fechas";
+import { aperturaHeredada, resumenDelta, type FotoItem, marcarFoto } from "../lib/turnChain";
+import { fotosDeLaCaja, esperadoDesdeFotoAnterior } from "../lib/turnReconciler";
 import {
   auditStmt,
   runBatch,
@@ -69,40 +71,128 @@ closing.get("/readings", requireModule("cierre"), async (c) => {
 
 // Toma una lectura de apertura para UNA ubicación puntual. Sigue siendo solo
 // para admin (igual que antes) — ahora hay que indicar cuál ubicación.
-closing.post("/readings", requireModule("cierre"), requireRole("admin"), async (c) => {
+closing.post("/readings", requireModule("cierre"), async (c) => {
   const db = drizzle(c.env.DB, { schema });
   const auth = c.get("auth");
-  const body = await c.req.json<{ locationId: string; notes?: string }>();
+  const body = await c.req.json<{
+    locationId: string;
+    notes?: string;
+    /** Conteo por producto. Sin esto, la lectura sale copiada del stock. */
+    items?: { productId: string; contado: number }[];
+    /** Hora a la que se contó, no a la que llegó. */
+    businessAt?: string | number;
+  }>();
   if (!body.locationId) return c.json({ ok: false, error: "locationId es requerido" }, 400);
 
   const location = await getActiveCompanyLocation(db, auth.companyId, body.locationId);
   if (!location) return c.json({ ok: false, error: "Ubicación no encontrada o inactiva" }, 404);
+  if (!(await canAccessLocationId(db, auth, location.id))) {
+    return c.json({ ok: false, error: "No tienes acceso a esa caja" }, 403);
+  }
+
+  const negocioEn = (() => {
+    const b = body.businessAt;
+    if (b === undefined || b === null || b === "") return new Date();
+    const d = new Date(typeof b === "number" ? b : String(b));
+    return Number.isFinite(d.getTime()) ? d : new Date();
+  })();
 
   const products = await db.select().from(schema.products)
     .where(and(eq(schema.products.companyId, auth.companyId), eq(schema.products.active, true))).all();
 
-  const items = [];
-  for (const p of products) {
-    const qty = await getLocationStockQty(db, location.id, p.id);
-    items.push({ productId: p.id, productCode: p.code, productName: p.name, unit: p.unit, qty });
+  // El stock que hay AHORA es el "esperado" de esta apertura: es lo que la caja
+  // dejó el turno anterior. Se guarda junto al conteo, no solo el conteo, porque
+  // sin el anterior no hay forma de saber qué cambió al ajustar.
+  const stockPrevio = new Map<string, number>();
+  for (const p of products) stockPrevio.set(p.id, await getLocationStockQty(db, location.id, p.id));
+
+  // ── ¿Cuenta, o hereda? ──
+  // El ajuste 2 del plan: con él activo, la apertura copia la foto anterior en
+  // lugar de contar. Ahorra el conteo pero deja la caja sin verificar en el cambio
+  // de turno, y el error aflora en el cierre siguiente atribuido a otro cajero.
+  const hereda = await aperturaHeredada(db, auth.companyId);
+
+  const items: FotoItem[] = [];
+  if (hereda) {
+    for (const p of products) {
+      const previo = stockPrevio.get(p.id) ?? 0;
+      items.push({ productId: p.id, productCode: p.code, productName: p.name, unit: p.unit, stockPrevio: previo, contado: previo });
+    }
+  } else {
+    const enviados = new Map<string, number>();
+    for (const it of body.items || []) {
+      const n = Number(it?.contado);
+      if (it?.productId && Number.isFinite(n) && n >= 0) enviados.set(it.productId, n);
+    }
+    // Sin conteo explícito, la foto ES el stock actual: es lo que pasaba con esta
+    // pantalla antes de que existiera el conteo, y no debe romperse.
+    for (const p of products) {
+      const previo = stockPrevio.get(p.id) ?? 0;
+      items.push({ productId: p.id, productCode: p.code, productName: p.name, unit: p.unit, stockPrevio: previo, contado: enviados.get(p.id) ?? previo });
+    }
   }
 
-  const reading = await db.insert(schema.inventoryReadings).values({
-    id: generateUUID(),
-    companyId: auth.companyId,
-    locationId: location.id,
-    takenById: auth.userId,
-    type: "apertura",
-    notes: body.notes || null,
-    items,
-  }).returning().get();
+  // El ajuste se calcula UNA vez, por producto, y se aplica en el mismo lote que
+  // guarda la foto. Si se guardaran por separado y fallara el ajuste, la caja
+  // quedaría con una foto que nunca se aplicó.
+  const { deltas } = resumenDelta(items);
+
+  const readingId = generateUUID();
+  const stmts: any[] = [];
+
+  stmts.push(
+    c.env.DB.prepare(
+      `INSERT INTO inventory_readings (id, company_id, location_id, taken_by_id, type, notes, items, origen, is_opening, created_at)
+       VALUES (?, ?, ?, ?, 'apertura', ?, ?, ?, 1, ?)`
+    ).bind(
+      readingId, auth.companyId, location.id, auth.userId, body.notes || null,
+      JSON.stringify(items), hereda ? "heredado" : "contado",
+      Math.floor(negocioEn.getTime() / 1000)
+    )
+  );
+
+  for (const [productId, deltaRaw] of Object.entries(deltas)) {
+    const delta = Number(deltaRaw);
+    stmts.push(ensureLocationStockStmt(c.env.DB, location.id, productId));
+    stmts.push(
+      delta > 0
+        ? incrementStockStmt(c.env.DB, location.id, productId, delta)
+        : decrementStockStmt(c.env.DB, location.id, productId, -delta)
+    );
+    stmts.push(
+      stockMovementStmt(c.env.DB, {
+        companyId: auth.companyId, productId, userId: auth.userId,
+        locationId: location.id,
+        type: "ajuste",
+        qty: delta,
+        reason: "Conteo de apertura",
+      })
+    );
+    stmts.push(recomputeProductStockStmt(c.env.DB, productId));
+  }
+
+  // La caja queda con una foto nueva a partir de este momento: lo que llegue con
+  // hora anterior ya está dentro de lo contado y no debe volver a aplicarse.
+  stmts.push(
+    c.env.DB.prepare(`UPDATE inventory_locations SET last_snapshot_at = ? WHERE id = ?`)
+      .bind(Math.floor(negocioEn.getTime() / 1000), location.id)
+  );
+
+  await runBatch(c.env.DB, stmts);
 
   await logAudit(c.env, {
     companyId: auth.companyId, userId: auth.userId,
-    action: "closing.take_reading", entity: "inventory_reading", entityId: reading.id,
-    detail: { locationName: location.name },
+    action: "closing.take_reading", entity: "inventory_reading", entityId: readingId,
+    detail: {
+      locationName: location.name,
+      origen: hereda ? "heredado" : "contado",
+      productosAjustados: Object.keys(deltas).length,
+    },
     ip: getClientIp(c),
   });
+
+  const reading = await db.select().from(schema.inventoryReadings)
+    .where(eq(schema.inventoryReadings.id, readingId)).get();
 
   return c.json({ ok: true, data: reading }, 201);
 });
@@ -130,6 +220,70 @@ async function loadInitialReading(db: ReturnType<typeof drizzle>, auth: any, ini
   }
   return reading;
 }
+
+// El estado de la cadena de esta caja: qué foto hay, cuál falta, y qué se espera
+// en la apertura siguiente.
+//
+// La UI lo usa para dos cosas: teachno que el cajerovee si lo que le dejaron no
+// cuadra ANTES de empezar a contar, y avisar de que falta un eslabón para que
+// faltantes no reales no se platiquen como si fueran de este turno.
+closing.get("/chain/:locationId", requireModule("cierre"), async (c) => {
+  const db = drizzle(c.env.DB, { schema });
+  const auth = c.get("auth");
+  const locationId = c.req.param("locationId");
+  if (!(await canAccessLocationId(db, auth, locationId))) {
+    return c.json({ ok: false, error: "No tienes acceso a esa caja" }, 403);
+  }
+
+  const fotos = await fotosDeLaCaja(db, auth.companyId, locationId);
+  const ultima = fotos.length ? fotos[fotos.length - 1] : null;
+
+  // La comparación que toca ahora, si es una apertura.
+  let esperado: { items: any[]; faltaEslabon: boolean; eslabonFaltante: string | null } | null = null;
+  if (ultima) {
+    const ahora = new Date();
+    const { items } = await esperadoDesdeFotoAnterior(db, auth.companyId, locationId, ultima, {
+      tipo: "apertura", id: "__preview__", at: ahora, items: [],
+    });
+    // ¿La vecina anterior de la última foto existe y se comparó? Si la última foto
+    // es una apertura, su vecina tiene que ser un cierre. Si no hay ninguno, la
+    // cadena empieza ahí y no falta nada: es la primera vez que se cuenta.
+    const previa = fotos.length > 1 ? fotos[fotos.length - 2] : null;
+    const hayCierrePrevio = fotos.some((f) => f.tipo === "cierre" && f.at.getTime() < ultima.at.getTime());
+    const hayLecturaPrevia = fotos.some((f) => f.tipo === "apertura" && f.at.getTime() < ultima.at.getTime());
+    const eslabonFaltante = !previa && ultima.tipo === "apertura" && !hayCierrePrevio ? null
+      : (!hayCierrePrevio && hayLecturaPrevia ? "falta el cierre anterior de esta caja" : null);
+
+    esperado = {
+      items: Object.entries(items).map(([productId, diff]) => ({ productId, diff: Number(diff) })),
+      faltaEslabon: !!eslabonFaltante,
+      eslabonFaltante,
+    };
+  }
+
+  const pendientes = await db.select().from(schema.turnReconciliations)
+    .where(and(
+      eq(schema.turnReconciliations.companyId, auth.companyId),
+      eq(schema.turnReconciliations.locationId, locationId),
+    )).orderBy(desc(schema.turnReconciliations.nextAt)).limit(20).all();
+
+  return c.json({
+    ok: true,
+    data: {
+      ultimaFoto: ultima ? { tipo: ultima.tipo, id: ultima.id, at: ultima.at, origen: ultima.origen } : null,
+      totalFotos: fotos.length,
+      esperado,
+      comparaciones: (pendientes as any[]).map((x) => ({
+        prevTipo: x.prevType, prevId: x.prevId,
+        nextTipo: x.nextType, nextId: x.nextId,
+        status: x.status, diffItems: x.diffItems, diffCash: x.diffCash,
+        prevAt: x.prevAt, nextAt: x.nextAt, reconciledAt: x.reconciledAt,
+      })),
+      // El negocio puede tener el ajuste 2 activo: la apertura no cuenta.
+      aperturaHeredada: await aperturaHeredada(db, auth.companyId),
+    },
+  });
+});
 
 closing.get("/preview/:initialReadingId", requireModule("cierre"), async (c) => {
   const db = drizzle(c.env.DB, { schema });
@@ -282,6 +436,9 @@ closing.post("/confirm", requireModule("cierre"), async (c) => {
     /** La HORA del conteo. Sin conexión puede ser horas anterior a cuando se
      *  sube, y de eso depende la ventana para explicar el descuadre. */
     countedAt?: string;
+    /** Turno que cierra este conteo. Con él, el turno queda cerrado en el mismo
+     *  lote que el cierre: o se guardan los dos, o no se guarda ninguno. */
+    shiftId?: string;
   }>().catch(() => null);
   if (!body?.initialReadingId) return c.json({ ok: false, error: "initialReadingId es requerido" }, 400);
 
@@ -290,6 +447,39 @@ closing.post("/confirm", requireModule("cierre"), async (c) => {
     return c.json({ ok: false, error: "Lectura inicial no encontrada o sin permisos sobre su ubicación" }, 404);
   }
   const locationId = initialReading.locationId!;
+
+  // ── El turno que se está cerrando ──
+  // El cierre pertenece a un turno, no a "la última lectura sin usar". Con el
+  // turno ligado, la lectura de apertura es obligatoriamente la de SU turno, y el
+  // turno queda cerrado en el mismo lote que el cierre: si el cierre se queda en
+  // la cola sin conexión, el turno sigue abierto y el siguiente cajero puede
+  // tomar la caja.
+  let turnoACerrar: typeof schema.shifts.$inferSelect | null = null;
+  if (body.shiftId) {
+    turnoACerrar = await db.select().from(schema.shifts).where(and(
+      eq(schema.shifts.id, String(body.shiftId)),
+      eq(schema.shifts.companyId, auth.companyId),
+    )).get() ?? null;
+    if (!turnoACerrar) {
+      return c.json({ ok: false, error: "Ese turno no existe o no es de esta empresa" }, 400);
+    }
+    if (turnoACerrar.locationId !== locationId) {
+      return c.json({ ok: false, error: "Ese turno es de otra caja. El cierre tiene que hacerse sobre la caja del turno." }, 400);
+    }
+    if (turnoACerrar.status === "cerrado") {
+      return c.json({ ok: false, error: "Ese turno ya está cerrado", code: "SHIFT_ALREADY_CLOSED" }, 409);
+    }
+    // La lectura de apertura del cierre tiene que ser la de SU turno. Es lo que
+    // impide asociar el cierre con el periodo equivocado cuando hay dos turnos
+    // seguidos en la misma caja.
+    if (turnoACerrar.openingReadingId && turnoACerrar.openingReadingId !== initialReading.id) {
+      return c.json({
+        ok: false,
+        error: "Este cierre no se hizo sobre la lectura de apertura de su turno",
+        code: "READING_NOT_FROM_SHIFT",
+      }, 409);
+    }
+  }
 
   // ── Una lectura de apertura se confirma UNA vez ───────────────────────────
   // Antes se podía confirmar dos veces y se creaban dos cierres (y dos
@@ -341,8 +531,28 @@ closing.post("/confirm", requireModule("cierre"), async (c) => {
     }
   }
 
+  // La hora del conteo la pone el cajero, no el servidor: si contó a las 8 y
+  // subió el cierre al día siguiente por falta de internet, la ventana de 20
+  // horas corre desde las 8. Si no se puede leer, se usa la del periodo.
+  //
+  // Va aquí y no más abajo porque el fin del período depende de ella: un cierre
+  // encolado tiene que cerrar el turno que se contó, no el día que llegó.
+  const countedAt = body.countedAt && Number.isFinite(Date.parse(body.countedAt))
+    ? new Date(body.countedAt)
+    : new Date();
+
   const periodStart = new Date(initialReading.createdAt!);
-  const periodEnd = new Date();
+  // El período termina cuando el cajero CONTÓ, no cuando el servidor recibió el
+  // cierre. Es la misma regla que ya siguen las ventas: una venta hecha el lunes
+  // sin conexión sigue siendo del lunes aunque llegue el martes (ver
+  // `offlineTimestamp` en lib/sales.ts).
+  //
+  // Con `new Date()` un cierre encolado arrastraba todas las ventas de los días
+  // que estuvo esperando en el dispositivo. Esas ventas sí caían dentro del
+  // período, así que el esperado las incluía y el faltante salía fantasma: el
+  // cajero contaba la caja del lunes y le decían que faltaba lo que se vendió el
+  // martes.
+  const periodEnd = countedAt ?? new Date();
 
   const sales = await db.select().from(schema.sales)
     .where(and(
@@ -434,13 +644,6 @@ closing.post("/confirm", requireModule("cierre"), async (c) => {
   const shiftId = turnoCierre?.id ?? null;
   const baseCash = dinero(turnoCierre?.baseCash);
   const countedCash = dinero(body.countedCash);
-
-  // La hora del conteo la pone el cajero, no el servidor: si contó a las 8 y
-  // subió el cierre al día siguiente por falta de internet, la ventana de 20
-  // horas corre desde las 8. Si no se puede leer, se usa la del periodo.
-  const countedAt = body.countedAt && Number.isFinite(Date.parse(body.countedAt))
-    ? new Date(body.countedAt)
-    : new Date();
 
   // Si no llega dinero contado, NO se calcula el descuadre. Hay dos caminos
   // que llegan aquí sin dinero: un cliente viejo que no conoce esta pantalla,
@@ -559,6 +762,25 @@ closing.post("/confirm", requireModule("cierre"), async (c) => {
         reason: "Cierre de inventario (conteo físico)",
       }),
       recomputeProductStockStmt(c.env.DB, item.productId)
+    );
+  }
+
+  // El cierre ES una foto de la caja: a partir de su hora, lo que llegue con
+  // una hora anterior ya está dentro del número contado. Sin esto, una venta
+  // tardía volvería a descontar lo que el cajero ya contó como faltante.
+  stmts.push(
+    c.env.DB.prepare(`UPDATE inventory_locations SET last_snapshot_at = ? WHERE id = ?`)
+      .bind(Math.floor((countedAt ?? new Date()).getTime() / 1000), locationId)
+  );
+
+  // Cerrar el turno en el MISMO lote que el cierre. Si el cierre se queda en la
+  // cola sin conexión, este lote no corre y el turno sigue abierto: el siguiente
+  // cajero puede tomar la caja y el negocio no se para.
+  if (turnoACerrar) {
+    stmts.push(
+      c.env.DB.prepare(
+        `UPDATE shifts SET status = 'cerrado', ended_at = ?, closing_id = ? WHERE id = ?`
+      ).bind(Math.floor((countedAt ?? new Date()).getTime() / 1000), closingId, turnoACerrar.id)
     );
   }
 

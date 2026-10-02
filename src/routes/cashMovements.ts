@@ -87,7 +87,7 @@ cashMovements.get("/", requireAnyModule("cierre", "pos", "contabilidad"), async 
 cashMovements.post("/", requireAnyModule("cierre", "pos", "contabilidad"), async (c) => {
   const db = drizzle(c.env.DB, { schema });
   const auth = c.get("auth");
-  const body = await c.req.json<{ locationId?: string; type?: string; amount?: number; currency?: string; reason?: string }>().catch(() => null);
+  const body = await c.req.json<{ locationId?: string; type?: string; amount?: number; currency?: string; reason?: string; businessAt?: string | number }>().catch(() => null);
   if (!body?.locationId) return c.json({ ok: false, error: "Indica la caja" }, 400);
 
   const type = body.type === "entrada" ? "entrada" : "salida";
@@ -126,12 +126,23 @@ cashMovements.post("/", requireAnyModule("cierre", "pos", "contabilidad"), async
   // propio retiro, el control no controlaría nada.
   const puedeAutoAprobar = !requiereAprobacion || auth.role === "admin";
 
+  // Hora de negocio: cuándo SAHIO (o entró) el dinero de verdad. Es lo que hace
+  // que la conciliación de la apertura siguiente cuente el retiro en su periodo y
+  // no en el día que volvió la conexión. Si no viene, se usa ahora.
+  const negocioEn = (() => {
+    const b = body?.businessAt;
+    if (b === undefined || b === null || b === "") return new Date();
+    const d = new Date(typeof b === "number" ? b : String(b));
+    return Number.isFinite(d.getTime()) ? d : new Date();
+  })();
+
   const turno = await getOpenShiftForUser(db, auth.companyId, auth.userId);
   const id = generateUUID();
   const mov = await db.insert(schema.cashMovements).values({
     id, companyId: auth.companyId, locationId: body.locationId,
     shiftId: turno?.locationId === body.locationId ? turno.id : null,
     userId: auth.userId, type, amount, currency,
+    businessAt: negocioEn,
     reason: motivo || null,
     status: puedeAutoAprobar ? "aprobada" : "pendiente",
     approvedById: puedeAutoAprobar ? auth.userId : null,
