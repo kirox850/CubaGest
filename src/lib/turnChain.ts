@@ -1,5 +1,11 @@
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/d1";
 import * as schema from "../db/schema";
+import { getLocationStockQty } from "./locations";
+import {
+  ensureLocationStockStmt, incrementStockStmt, decrementStockStmt,
+  recomputeProductStockStmt, stockMovementStmt,
+} from "./batch";
 
 // ─── REGLA DE APLICACIÓN DE STOCK (plan de cadena de turnos, F0) ──────────────
 //
@@ -158,4 +164,103 @@ export async function aperturaHeredada(db: any, companyId: string): Promise<bool
   const s: any = await db.select().from(schema.companySettings)
     .where(eq(schema.companySettings.companyId, companyId)).get();
   return s?.openingInheritsPrevious === true;
+}
+
+// ─── LA FOTO DE APERTURA, EN UN SOLO SITIO ───────────────────────────────────
+//
+// Hasta ahora había TRES puertas que creaban una foto de apertura y cada una lo
+// hacía a su manera: /closing/readings contaba, /shift/start copiaba el stock a
+// ciegas, y el cierre generaba la suya sin guardar el dinero. La app abre turno
+// por /shift/start, así que el conteo real nunca se veía.
+//
+// Ahora hay una sola función y las tres la usan. Devuelve PREPARED STATEMENTS y
+// no ejecuta nada: el llamante mete todo en su lote, para que la foto y el turno
+// se guarden o no se guarden nunca, nunca a medias.
+
+export interface ArgsFotoApertura {
+  readingId: string;
+  companyId: string;
+  locationId: string;
+  userId: string;
+  notas?: string | null;
+  /** Conteo por producto. Si viene vacío, la foto ES el stock actual. */
+  items?: { productId: string; contado: number }[];
+  /** Hora a la que se CUENTA. Es lo que fija hasta dónde llega la foto. */
+  negocioEn: Date;
+}
+
+/**
+ * Prepara la escritura completa de una foto de apertura:
+ * la lectura, el ajuste por diferencia y la marca de "última foto" de la caja.
+ */
+export async function stmtsFotoApertura(DB: D1Database, args: ArgsFotoApertura): Promise<D1PreparedStatement[]> {
+  const { readingId, companyId, locationId, userId, negocioEn } = args;
+  const db = drizzle(DB, { schema });
+
+  // El ajuste 2 del plan: con él activo, la apertura copia la foto anterior en
+  // lugar de contar. Apagado por defecto — no verificar la caja en el cambio de
+  // turno hace que el error aflore en el cierre siguiente, atribuido a otro cajero.
+  const hereda = await aperturaHeredada(db, companyId);
+
+  const products = await db.select().from(schema.products)
+    .where(and(eq(schema.products.companyId, companyId), eq(schema.products.active, true))).all();
+
+  const stockPrevio = new Map<string, number>();
+  for (const p of products) stockPrevio.set(p.id, await getLocationStockQty(db, locationId, p.id));
+
+  const enviados = new Map<string, number>();
+  for (const it of args.items || []) {
+    const n = Number(it?.contado);
+    if (it?.productId && Number.isFinite(n) && n >= 0) enviados.set(String(it.productId), n);
+  }
+
+  const items: FotoItem[] = [];
+  for (const p of products) {
+    const previo = stockPrevio.get(p.id) ?? 0;
+    // Heredado: la copia es el stock. Sin conteo explícito: la foto ES el stock,
+    // que es lo que pasaba con esta pantalla antes de que existiera el conteo.
+    const contado = hereda ? previo : (enviados.get(String(p.id)) ?? previo);
+    items.push({
+      productId: p.id, productCode: p.code, productName: p.name, unit: p.unit,
+      stockPrevio: previo, contado,
+    });
+  }
+
+  const { deltas } = resumenDelta(items);
+  const stmts: D1PreparedStatement[] = [
+    DB.prepare(
+      `INSERT INTO inventory_readings (id, company_id, location_id, taken_by_id, type, notes, items, origen, is_opening, created_at)
+       VALUES (?, ?, ?, ?, 'apertura', ?, ?, ?, 1, ?)`
+    ).bind(
+      readingId, companyId, locationId, userId, args.notas || null,
+      JSON.stringify(items), hereda ? "heredado" : "contado",
+      Math.floor(negocioEn.getTime() / 1000)
+    ),
+  ];
+
+  for (const [productId, deltaRaw] of Object.entries(deltas)) {
+    const delta = Number(deltaRaw);
+    stmts.push(ensureLocationStockStmt(DB, locationId, productId));
+    stmts.push(
+      delta > 0
+        ? incrementStockStmt(DB, locationId, productId, delta)
+        : decrementStockStmt(DB, locationId, productId, -delta)
+    );
+    stmts.push(
+      stockMovementStmt(DB, {
+        companyId, productId, userId, locationId,
+        type: "ajuste", qty: delta, reason: "Conteo de apertura",
+      })
+    );
+    stmts.push(recomputeProductStockStmt(DB, productId));
+  }
+
+  // A partir de esta hora, lo que llegue con hora anterior ya está dentro de lo
+  // contado y no debe volver a aplicarse al stock.
+  stmts.push(
+    DB.prepare(`UPDATE inventory_locations SET last_snapshot_at = ? WHERE id = ?`)
+      .bind(Math.floor(negocioEn.getTime() / 1000), locationId)
+  );
+
+  return stmts;
 }

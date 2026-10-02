@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import type { Context } from "hono";
 import { eq, and, gte, lte, desc, inArray } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import * as schema from "../db/schema";
@@ -14,8 +15,8 @@ import {
   VENTANA_PROVISIONAL_HORAS,
 } from "../lib/cierreDinero";
 import { segundos, ahoraEnSegundos } from "../lib/fechas";
-import { aperturaHeredada, resumenDelta, type FotoItem, marcarFoto } from "../lib/turnChain";
-import { fotosDeLaCaja, esperadoDesdeFotoAnterior } from "../lib/turnReconciler";
+import { aperturaHeredada, stmtsFotoApertura } from "../lib/turnChain";
+import { fotosDeLaCaja, esperadoDesdeFotoAnterior, reconciliarCaja } from "../lib/turnReconciler";
 import {
   auditStmt,
   runBatch,
@@ -77,9 +78,7 @@ closing.post("/readings", requireModule("cierre"), async (c) => {
   const body = await c.req.json<{
     locationId: string;
     notes?: string;
-    /** Conteo por producto. Sin esto, la lectura sale copiada del stock. */
     items?: { productId: string; contado: number }[];
-    /** Hora a la que se contó, no a la que llegó. */
     businessAt?: string | number;
   }>();
   if (!body.locationId) return c.json({ ok: false, error: "locationId es requerido" }, 400);
@@ -97,97 +96,32 @@ closing.post("/readings", requireModule("cierre"), async (c) => {
     return Number.isFinite(d.getTime()) ? d : new Date();
   })();
 
-  const products = await db.select().from(schema.products)
-    .where(and(eq(schema.products.companyId, auth.companyId), eq(schema.products.active, true))).all();
-
-  // El stock que hay AHORA es el "esperado" de esta apertura: es lo que la caja
-  // dejó el turno anterior. Se guarda junto al conteo, no solo el conteo, porque
-  // sin el anterior no hay forma de saber qué cambió al ajustar.
-  const stockPrevio = new Map<string, number>();
-  for (const p of products) stockPrevio.set(p.id, await getLocationStockQty(db, location.id, p.id));
-
-  // ── ¿Cuenta, o hereda? ──
-  // El ajuste 2 del plan: con él activo, la apertura copia la foto anterior en
-  // lugar de contar. Ahorra el conteo pero deja la caja sin verificar en el cambio
-  // de turno, y el error aflora en el cierre siguiente atribuido a otro cajero.
-  const hereda = await aperturaHeredada(db, auth.companyId);
-
-  const items: FotoItem[] = [];
-  if (hereda) {
-    for (const p of products) {
-      const previo = stockPrevio.get(p.id) ?? 0;
-      items.push({ productId: p.id, productCode: p.code, productName: p.name, unit: p.unit, stockPrevio: previo, contado: previo });
-    }
-  } else {
-    const enviados = new Map<string, number>();
-    for (const it of body.items || []) {
-      const n = Number(it?.contado);
-      if (it?.productId && Number.isFinite(n) && n >= 0) enviados.set(it.productId, n);
-    }
-    // Sin conteo explícito, la foto ES el stock actual: es lo que pasaba con esta
-    // pantalla antes de que existiera el conteo, y no debe romperse.
-    for (const p of products) {
-      const previo = stockPrevio.get(p.id) ?? 0;
-      items.push({ productId: p.id, productCode: p.code, productName: p.name, unit: p.unit, stockPrevio: previo, contado: enviados.get(p.id) ?? previo });
-    }
-  }
-
-  // El ajuste se calcula UNA vez, por producto, y se aplica en el mismo lote que
-  // guarda la foto. Si se guardaran por separado y fallara el ajuste, la caja
-  // quedaría con una foto que nunca se aplicó.
-  const { deltas } = resumenDelta(items);
-
   const readingId = generateUUID();
-  const stmts: any[] = [];
 
-  stmts.push(
-    c.env.DB.prepare(
-      `INSERT INTO inventory_readings (id, company_id, location_id, taken_by_id, type, notes, items, origen, is_opening, created_at)
-       VALUES (?, ?, ?, ?, 'apertura', ?, ?, ?, 1, ?)`
-    ).bind(
-      readingId, auth.companyId, location.id, auth.userId, body.notes || null,
-      JSON.stringify(items), hereda ? "heredado" : "contado",
-      Math.floor(negocioEn.getTime() / 1000)
-    )
-  );
+  // La MISMA función que usa /shift/start. Antes cada puerta escribía la foto a su
+  // manera y solo una contaba; ahora no puede pasar.
+  const stmts = await stmtsFotoApertura(c.env.DB, {
+    readingId,
+    companyId: auth.companyId,
+    locationId: location.id,
+    userId: auth.userId,
+    notas: body.notes || null,
+    items: body.items,
+    negocioEn,
+  });
+  await c.env.DB.batch(stmts);
 
-  for (const [productId, deltaRaw] of Object.entries(deltas)) {
-    const delta = Number(deltaRaw);
-    stmts.push(ensureLocationStockStmt(c.env.DB, location.id, productId));
-    stmts.push(
-      delta > 0
-        ? incrementStockStmt(c.env.DB, location.id, productId, delta)
-        : decrementStockStmt(c.env.DB, location.id, productId, -delta)
-    );
-    stmts.push(
-      stockMovementStmt(c.env.DB, {
-        companyId: auth.companyId, productId, userId: auth.userId,
-        locationId: location.id,
-        type: "ajuste",
-        qty: delta,
-        reason: "Conteo de apertura",
-      })
-    );
-    stmts.push(recomputeProductStockStmt(c.env.DB, productId));
-  }
-
-  // La caja queda con una foto nueva a partir de este momento: lo que llegue con
-  // hora anterior ya está dentro de lo contado y no debe volver a aplicarse.
-  stmts.push(
-    c.env.DB.prepare(`UPDATE inventory_locations SET last_snapshot_at = ? WHERE id = ?`)
-      .bind(Math.floor(negocioEn.getTime() / 1000), location.id)
-  );
-
-  await runBatch(c.env.DB, stmts);
+  const hereda = await aperturaHeredada(db, auth.companyId);
+  const ajustados = await db.select({ items: schema.inventoryReadings.items })
+    .from(schema.inventoryReadings)
+    .where(eq(schema.inventoryReadings.id, readingId)).get();
+  const filas: any[] = JSON.parse((ajustados?.items as any) || "[]");
+  const productosAjustados = filas.filter((f) => Number(f.contado) !== Number(f.stockPrevio)).length;
 
   await logAudit(c.env, {
     companyId: auth.companyId, userId: auth.userId,
     action: "closing.take_reading", entity: "inventory_reading", entityId: readingId,
-    detail: {
-      locationName: location.name,
-      origen: hereda ? "heredado" : "contado",
-      productosAjustados: Object.keys(deltas).length,
-    },
+    detail: { locationName: location.name, origen: hereda ? "heredado" : "contado", productosAjustados },
     ip: getClientIp(c),
   });
 
@@ -426,7 +360,15 @@ closing.get("/preview/:initialReadingId", requireModule("cierre"), async (c) => 
 // POST /closing/confirm
 // Reconciliación de INVENTARIO (el conteo físico ajusta el stock de la caja),
 // no de caja física: el dinero se registra, no se cuenta.
-closing.post("/confirm", requireModule("cierre"), async (c) => {
+// POST /closing/confirm
+// Reconciliación de INVENTARIO (el conteo físico ajusta el stock de la caja),
+// no de caja física: el dinero se registra, no se cuenta.
+//
+// Exportado y reutilizado por /shift/end: terminar el turno ES hacer el cierre del
+// periodo. Se comparte el handler entero en vez de reescribir el cierre aquí, porque
+// dos maneras distintas de cerrar un periodo es exactamente como una de las dos se
+// queda sin conciliar.
+export const confirmarCierreHandler = async (c: Context<{ Bindings: Env }>) => {
   const db = drizzle(c.env.DB, { schema });
   const auth = c.get("auth");
   const body = await c.req.json<{
@@ -691,8 +633,8 @@ closing.post("/confirm", requireModule("cierre"), async (c) => {
     // cerrar la transacción. Con el cierre antes, apuntaba a una lectura que
     // todavía no existía y D1 devolvía "FOREIGN KEY constraint failed".
     c.env.DB.prepare(
-      `INSERT INTO inventory_readings (id, company_id, location_id, taken_by_id, type, notes, items, created_at)
-       VALUES (?, ?, ?, ?, 'cierre', ?, ?, ?)`
+      `INSERT INTO inventory_readings (id, company_id, location_id, taken_by_id, type, notes, items, origen, is_opening, created_at)
+       VALUES (?, ?, ?, ?, 'cierre', ?, ?, 'contado', 0, ?)`
     ).bind(
       closingReadingId, auth.companyId, locationId, auth.userId,
       "Generada automaticamente al cierre", JSON.stringify(closingReadingItems), ahoraEnSegundos()
@@ -844,9 +786,24 @@ closing.post("/confirm", requireModule("cierre"), async (c) => {
     }
   }
 
-  return c.json({ ok: true, data: closingRecord }, 201);
-});
+  // ── Conciliar la cadena de turnos ──
+  // El cierre es una foto más de la caja. Al guardarla, se resuelve su comparación
+  // con la foto anterior y queda anotada en turn_reconciliations, para que el
+  // siguiente turno vea el descuadre como lo que es —de este periodo— y no como
+  // una caja que llega mal.
+  //
+  // NO ajusta stock: la foto ya lo ajustó al llegar. Esto solo detecta y anota.
+  // Y si falla, el cierre sigue guardado: la conciliación se reintenta en el
+  // siguiente ciclo y en el barrido del cron.
+  let conciliacionCadena = { compared: 0, pending: 0, different: 0 };
+  try {
+    conciliacionCadena = await reconciliarCaja(db, auth.companyId, locationId);
+  } catch (e) {
+    console.error("reconciliarCaja tras el cierre falló:", e);
+  }
 
+  return c.json({ ok: true, data: closingRecord, conciliacionCadena }, 201);
+};
 closing.get("/", requireModule("cierre"), async (c) => {
   const db = drizzle(c.env.DB, { schema });
   const auth = c.get("auth");

@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import type { Context } from "hono";
 import { eq, and, desc } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import * as schema from "../db/schema";
@@ -11,6 +12,8 @@ import {
   turnosDisponiblesEn,
 } from "../lib/locations";
 import { dinero } from "../lib/cierreDinero";
+import { stmtsFotoApertura } from "../lib/turnChain";
+import { confirmarCierreHandler } from "./closing";
 
 // ─── TURNOS ──────────────────────────────────────────────────────────────────
 //
@@ -75,7 +78,15 @@ shifts.get("/current", requireAnyModule("pos", "cierre", "inventario", "facturac
 shifts.post("/start", requireModule("pos"), async (c) => {
   const db = drizzle(c.env.DB, { schema });
   const auth = c.get("auth");
-  const body = await c.req.json<{ locationId?: string; baseCash?: Record<string, number> }>();
+  // `items` es el conteo de apertura. Sin él, la foto sale copiada del stock: el
+  // sistema se verifica a sí mismo y no cuenta nada. `businessAt` es la hora en la
+  // que se CUENTA, no la de ahora, porque es la que fija hasta dónde llega la foto.
+  const body = await c.req.json<{
+    locationId?: string;
+    baseCash?: Record<string, number>;
+    items?: { productId: string; contado: number }[];
+    businessAt?: string | number;
+  }>();
   const locationId = body.locationId;
   if (!locationId) return c.json({ ok: false, error: "Elige una caja para trabajar" }, 400);
 
@@ -116,50 +127,64 @@ shifts.post("/start", requireModule("pos"), async (c) => {
     return c.json({ ok: false, error: `Ya tienes un turno abierto en ${yaTengo.location.name}. Ciérralo antes de abrir otro.` }, 409);
   }
 
-  // La lectura de apertura ES la foto del stock con la que arranca el turno.
-  // Se crea aquí, en el servidor, para que sea la misma para todos los que
-  // vean el turno.
-  const products = await db.select().from(schema.products)
-    .where(and(eq(schema.products.companyId, auth.companyId), eq(schema.products.active, true))).all();
-  const stockRows = await db.select().from(schema.locationStock)
-    .where(eq(schema.locationStock.locationId, location.id)).all();
-  const stockBy = new Map(stockRows.map((r) => [r.productId, Number(r.qty)]));
+  // ── La foto de apertura ──
+  //
+  // ANTES: aquí se copiaba el stock actual y se llamaba "lectura". El sistema se
+  // copiaba a sí mismo y la caja quedaba sin verificar en cada cambio de turno.
+  // Por eso el conteo real vivía en otra pantalla y nunca se disparaba.
+  //
+  // AHORA: es un conteo de verdad, con el mismo código que el resto de puertas
+  // (stmtsFotoApertura). Si el negocio tiene activada la apertura heredada, se
+  // copia la foto anterior y no se cuenta.
+  //
+  // OBLIGATORIO DE ABRIR, LIBRE DE RELLENAR: hay que pasar por aquí, pero el
+  // cajero puede aceptar lo que ve tal cual. Eso es firma, no error: si luego hay
+  // faltante, es de quien aceptó contar y no contó.
+  const negocioEn = (() => {
+    const b = body.businessAt;
+    if (b === undefined || b === null || b === "") return new Date();
+    const d = new Date(typeof b === "number" ? b : String(b));
+    return Number.isFinite(d.getTime()) ? d : new Date();
+  })();
 
   const readingId = generateUUID();
-  const items = products.map((p) => ({
-    productId: p.id, productCode: p.code, productName: p.name, unit: p.unit,
-    qty: stockBy.get(p.id) ?? 0,
-  }));
-
   const shiftId = generateUUID();
-  // db.batch es una sola transacción: o queda el turno y su lectura, o no queda
-  // ninguno. Nunca un turno abierto sin su punto de partida.
-  //
-  // EL ORDEN IMPORTA y no es cosa de estilo. shifts.opening_reading_id es una
-  // clave foránea a inventory_readings, y SQLite comprueba las claves foráneas
-  // en el momento de cada INSERT, no al cerrar la transacción. Si el turno va
-  // primero, apunta a una lectura que todavía no existe y la base lo rechaza
-  // con "FOREIGN KEY constraint failed": el turno no se abre y la pantalla
-  // dice "error interno del servidor". Por eso la lectura va PRIMERO.
-  //
-  // Esto costó dos 500 seguidos. El primero era un cast que mentía sobre el
-  // tipo de lo que se pasaba al lote, y tapaba este. Al arreglar el primero
-  // apareció el segundo. Los dos estaban en la misma línea.
-  await db.batch([
-    db.insert(schema.inventoryReadings).values({
-      id: readingId, companyId: auth.companyId, locationId: location.id, takenById: auth.userId,
-      type: "apertura", notes: `Inicio de turno en ${location.name}`, items,
-    }),
-    db.insert(schema.shifts).values({
-      id: shiftId, companyId: auth.companyId, locationId: location.id, userId: auth.userId,
-      status: "abierto", openingReadingId: readingId, baseCash,
-    }),
-  ]);
+
+  const stmts = await stmtsFotoApertura(c.env.DB, {
+    readingId,
+    companyId: auth.companyId,
+    locationId: location.id,
+    userId: auth.userId,
+    notas: `Inicio de turno en ${location.name}`,
+    items: body.items,
+    negocioEn,
+  });
+
+  stmts.push(
+    // EL TURNO VA DESPUÉS de la foto, y no por estilo: shifts.opening_reading_id
+    // es clave foránea a inventory_readings, y SQLite las comprueba en el momento
+    // de cada INSERT, no al cerrar la transacción. Con el turno primero apuntaría
+    // a una lectura que todavía no existe. Esto costó dos 500 seguidos.
+    c.env.DB.prepare(
+      `INSERT INTO shifts (id, company_id, location_id, user_id, status, opening_reading_id, base_cash, started_at)
+       VALUES (?, ?, ?, ?, 'abierto', ?, ?, ?)`
+    ).bind(
+      shiftId, auth.companyId, location.id, auth.userId,
+      readingId, baseCash ?? null, Math.floor(negocioEn.getTime() / 1000)
+    )
+  );
+
+  // Un solo lote: o queda el turno y su foto, o no queda ninguno. Nunca un turno
+  // abierto sin su punto de partida, ni una foto de un turno que no llegó a abrir.
+  await c.env.DB.batch(stmts);
 
   await logAudit(c.env, {
     companyId: auth.companyId, userId: auth.userId,
     action: "shift.start", entity: "shift", entityId: shiftId,
-    detail: { locationName: location.name }, ip: getClientIp(c),
+    detail: {
+      locationName: location.name,
+      productosContados: Array.isArray(body.items) ? body.items.length : 0,
+    }, ip: getClientIp(c),
   });
 
   return c.json({
@@ -170,65 +195,73 @@ shifts.post("/start", requireModule("pos"), async (c) => {
   }, 201);
 });
 
-// POST /shift/end — cerrar el turno. El cierre de caja (contar) es un paso
-// aparte y opcional: se puede cerrar el turno sin haber contado.
-shifts.post("/end", requireAnyModule("pos", "cierre"), async (c) => {
+// POST /shift/end — terminar el turno.
+//
+// ANTES: cerraba el turno y ya. El cierre de caja era un paso aparte y OPCIONAL,
+// en otra pantalla. Eso dejaba la cadena con turnos sin foto: el siguiente cajero
+// abría contra la lectura de apertura de dos turnos antes y todo lo que pasó en
+// medio se le endosaba a él.
+//
+// AHORA: terminar el turno ES hacer el cierre del periodo. Cuenta la caja, cierra
+// la caja y concilia la cadena, sin que el cajero tenga que ir a otra pantalla a
+// repetir el mismo trabajo. Se reutiliza el MISMO handler de /closing/confirm en
+// vez de reescribir el cierre: dos maneras de cerrar un periodo es exactamente
+// como una de las dos se queda sin conciliar.
+//
+// OBLIGATORIO DE TERMINAR, LIBRE DE RELLENAR: se pasa por el conteo, pero puede
+// aceptarse tal cual. Firmar sin contar es una decisión, y si después hay faltante
+// es de quien firmó.
+shifts.post(
+  "/end",
+  requireAnyModule("pos", "cierre"),
+  prepararCierreDeTurno,
+  confirmarCierreHandler,
+);
+
+/**
+ * Prepara el cierre al terminar el turno.
+ *
+ * Solo hace dos cosas, y las dos son validaciones: que el turno tenga foto de
+ * apertura (sin ella no hay contra qué cerrar) y decir cuál es, para que el cierre
+ * sepa que turno está cerrando y lo cierre en el mismo lote.
+ *
+ * Lo que viene después —contar, conciliar, ajustar— es el handler de /closing/confirm
+ * tal cual. No se duplica aquí a propósito.
+ */
+async function prepararCierreDeTurno(c: Context<{ Bindings: Env }>, next: () => Promise<void>) {
   const db = drizzle(c.env.DB, { schema });
   const auth = c.get("auth");
+
   const turno = await getOpenShiftForUser(db, auth.companyId, auth.userId);
   if (!turno) return c.json({ ok: false, error: "No tienes ningún turno abierto" }, 400);
 
-  // ── Un turno no se cierra sin cierre ──
-  // Antes bastaba con pulsar "terminar turno" y el turno se cerraba solo. Eso
-  // dejaba un turno en la cadena sin foto de cierre: el siguiente cajero abría
-  // contra la lectura de apertura de DOS turnos antes y todo lo que pasó entre
-  // medio se le endosaba a él.
-  //
-  // Ahora el cierre es lo que cierra el turno, en el mismo lote (ver
-  // routes/closing.ts /confirm). Si el turno tiene cierre, aquí solo se confirma
-  // el estado. Si no lo tiene, se dice qué hacer en vez de dejar un hueco.
-  const yaCerrado = await db.select({ id: schema.cashClosings.id }).from(schema.cashClosings)
-    .where(and(
-      eq(schema.cashClosings.companyId, auth.companyId),
-      eq(schema.cashClosings.locationId, turno.locationId),
-    )).orderBy(desc(schema.cashClosings.countedAt)).get();
-
-  const tieneLectura = turno.openingReadingId
-    || await db.select({ id: schema.inventoryReadings.id }).from(schema.inventoryReadings)
-      .where(and(
-        eq(schema.inventoryReadings.companyId, auth.companyId),
-        eq(schema.inventoryReadings.locationId, turno.locationId),
-        eq(schema.inventoryReadings.type, "apertura"),
-      )).orderBy(desc(schema.inventoryReadings.createdAt)).get();
-
-  if (!tieneLectura) {
+  // Sin foto de apertura no hay contra qué cerrar. Antes esto pasaba en silencio:
+  // el turno se cerraba igual y quedaba un hueco en la cadena.
+  if (!turno.openingReadingId) {
     return c.json({
       ok: false,
-      error: "Primero abre el turno: haz el conteo de apertura. Sin lectura no hay con qué cerrar.",
+      error: "Este turno no tiene conteo de apertura. No se puede cerrar un turno sin punto de partida.",
       code: "SHIFT_WITHOUT_READING",
     }, 409);
   }
 
-  if (!yaCerrado) {
-    return c.json({
-      ok: false,
-      error: "No puedes terminar el turno sin hacer el cierre. Al confirmar el cierre, el turno se cierra solo.",
-      code: "SHIFT_WITHOUT_CLOSING",
-    }, 409);
-  }
+  const body = await c.req.json<{
+    items?: any[];
+    countedCash?: Record<string, number>;
+    countedAt?: string;
+    notes?: string;
+  }>().catch(() => ({}));
 
-  await db.update(schema.shifts)
-    .set({ status: "cerrado", endedAt: new Date() })
-    .where(eq(schema.shifts.id, turno.id));
-
-  await logAudit(c.env, {
-    companyId: auth.companyId, userId: auth.userId,
-    action: "shift.end", entity: "shift", entityId: turno.id,
-    detail: { locationName: turno.location.name }, ip: getClientIp(c),
+  // El turno manda su propia foto. El cierre la usa como periodo y cierra el turno
+  // en el mismo lote, así que no hay ventana en la que uno esté y el otro no.
+  c.req.raw = new Request(c.req.raw.url, {
+    method: "POST",
+    headers: c.req.raw.headers,
+    body: JSON.stringify({ ...body, initialReadingId: turno.openingReadingId, shiftId: turno.id }),
   });
 
-  return c.json({ ok: true, data: { closed: turno.id } });
-});
+  await next();
+}
 
 // ── Asignación de cajas (solo admin) ────────────────────────────────────────
 
