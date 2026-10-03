@@ -170,7 +170,19 @@ shifts.post("/start", requireModule("pos"), async (c) => {
        VALUES (?, ?, ?, ?, 'abierto', ?, ?, ?)`
     ).bind(
       shiftId, auth.companyId, location.id, auth.userId,
-      readingId, baseCash ?? null, Math.floor(negocioEn.getTime() / 1000)
+      readingId,
+      // `base_cash` es una columna TEXT con modo JSON, y aquí NO pasa por Drizzle:
+      // se escribe a mano porque el turno tiene que ir DESPUÉS de la foto (las
+      // claves foráneas se comprueban en cada INSERT, no al cerrar el lote).
+      //
+      // Esa es la trampa: Drizzle serializa solo los campos `mode: "json"`, y al
+      // escribir a mano eso no ocurre. El `bind()` de D1 solo admite null,
+      // número, string y buffers — un objeto suelto lo rechaza con
+      // D1_TYPE_ERROR y el turno entero se cae con 500. De ahí el
+      // JSON.stringify explícito. Y `|| {}` en vez de `?? null`: la columna es
+      // NOT NULL.
+      JSON.stringify(baseCash || {}),
+      Math.floor(negocioEn.getTime() / 1000)
     )
   );
 
