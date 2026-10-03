@@ -160,6 +160,21 @@ export async function resolveOwnLocation(db: DB, auth: AuthContext) {
     const asignadas = await getCajasAsignadas(db, auth.companyId, auth.userId);
     return asignadas.length === 1 ? await getActiveCompanyLocation(db, auth.companyId, asignadas[0].id) : null;
   }
+  // El admin SÍ tiene una ubicación de trabajo. Antes caía en el `return null` de
+  // abajo —que estaba pensado para "cualquier otro rol"— y eso lo dejaba sin
+  // ninguna: sin caja, sin almacén y sin stock, así que no podía vender ni
+  // registrar movimientos, solo mirar. Es más, un envío al almacén central se
+  // quedaba sin nadie que lo aprobara, porque `canResolveTransfer` solo dejaba
+  // aprobar a cajero y almacenista.
+  //
+  // El turno abierto manda igual que al cajero: si el admin está trabajando en una
+  // caja concreta, esa es "la suya" ahora mismo.
+  if (auth.role === "admin") {
+    const turno = await getOpenShiftForUser(db, auth.companyId, auth.userId);
+    if (turno) return turno.location;
+    // Sin turno, el almacén central: es de la empresa y el admin la gestiona.
+    return await getActiveAlmacenLocation(db, auth.companyId);
+  }
   return null;
 }
 

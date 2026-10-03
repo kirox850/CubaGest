@@ -47,6 +47,14 @@ async function canResolveTransfer(
   if (!toLocation) return false;
   if (auth.role === "almacenista") return toLocation.type === "almacen";
   if (auth.role === "cajero") return toLocation.type === "caja" && toLocation.ownerUserId === auth.userId;
+  // El admin aprueba lo que va al almacén central, igual que el almacenista.
+  //
+  // Sin esto el flujo se quedaba COLGADO: `canCancel` sí le dejaba cancelar, pero
+  // `canResolve` le devolvía false y no podía aprobar nunca. Un envío de una caja
+  // al almacén central se quedaba esperando a alguien que no existía y el
+  // remitente solo podía cancelarlo. El comentario de esta función daba por hecho
+  // que el admin podía; la función nunca lo permitió.
+  if (auth.role === "admin") return toLocation.type === "almacen";
   return false;
 }
 
