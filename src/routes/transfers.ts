@@ -7,7 +7,7 @@ import { requireModule } from "../middleware/roles";
 import { generateUUID } from "../lib/jwt";
 import { logAudit, getClientIp } from "../lib/audit";
 import { notify, transferRecipientsOrAdmins } from "../lib/push";
-import { resolveOwnLocation, getLocationStockQty, getActiveCompanyLocation } from "../lib/locations";
+import { resolveOwnLocation, getLocationStockQty, getActiveCompanyLocation, getCajasAsignadas } from "../lib/locations";
 import {
   ensureLocationStockStmt,
   decrementStockStmt,
@@ -46,7 +46,23 @@ async function canResolveTransfer(
   const toLocation = await getActiveCompanyLocation(db, auth.companyId, transfer.toLocationId);
   if (!toLocation) return false;
   if (auth.role === "almacenista") return toLocation.type === "almacen";
-  if (auth.role === "cajero") return toLocation.type === "caja" && toLocation.ownerUserId === auth.userId;
+  // El cajero aprueba la caja que TIENE ASIGNADA.
+//
+// Se pregunta a la tabla de asignaciones y NO a `ownerUserId`, que es el modelo
+// viejo: desde que las cajas son del negocio, `POST /locations` las crea con
+// `ownerUserId: null` a propósito (ver routes/locations.ts) y el uso se lleva en
+// `locationAssignments`. Preguntar por `ownerUserId` daba false SIEMPRE, así que
+// un cajero con su caja asignada no veía ni Aprobar ni Rechazar y el flujo se
+// quedaba colgado esperando a alguien que no podía resolverlo.
+//
+// El `ownerUserId` se conserva como respaldo para las cajas creadas antes de ese
+// cambio, que son las únicas que aún lo tienen puesto.
+if (auth.role === "cajero") {
+  if (toLocation.type !== "caja") return false;
+  if (toLocation.ownerUserId === auth.userId) return true;
+  const asignadas = await getCajasAsignadas(db, auth.companyId, auth.userId);
+  return asignadas.some((c) => c.id === transfer.toLocationId);
+}
   // El admin aprueba lo que va al almacén central, igual que el almacenista.
   //
   // Sin esto el flujo se quedaba COLGADO: `canCancel` sí le dejaba cancelar, pero
