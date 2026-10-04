@@ -240,7 +240,10 @@ shifts.post(
  * Lo que viene después —contar, conciliar, ajustar— es el handler de /closing/confirm
  * tal cual. No se duplica aquí a propósito.
  */
-async function prepararCierreDeTurno(c: Context<{ Bindings: Env }>, next: () => Promise<void>) {
+async function prepararCierreDeTurno(
+  c: Context<{ Bindings: Env; Variables: { initialReadingId?: string; shiftId?: string } }>,
+  next: () => Promise<void>
+) {
   const db = drizzle(c.env.DB, { schema });
   const auth = c.get("auth");
 
@@ -266,11 +269,16 @@ async function prepararCierreDeTurno(c: Context<{ Bindings: Env }>, next: () => 
 
   // El turno manda su propia foto. El cierre la usa como periodo y cierra el turno
   // en el mismo lote, así que no hay ventana en la que uno esté y el otro no.
-  c.req.raw = new Request(c.req.raw.url, {
-    method: "POST",
-    headers: c.req.raw.headers,
-    body: JSON.stringify({ ...body, initialReadingId: turno.openingReadingId, shiftId: turno.id }),
-  });
+  // Se pasan por CONTEXTO, no reescribiendo `c.req.raw`.
+//
+// Lo que había aquí —leer el body, clonarlo con los campos del turno y meterlo
+// en `c.req.raw`— no llegaba nunca al handler: Hono cachea el body ya parseado
+// en el primer `c.req.json()`, así que cuando `confirmarCierreHandler` vuelve a
+// pedirlo recibe SIEMPRE el original, sin los campos inyectados. De ahí el
+// "initialReadingId requerido" al cerrar el turno: el middleware lo comprobaba
+// (y pasaba el 409 si faltaba), pero su valor se perdía de camino.
+c.set("initialReadingId", turno.openingReadingId);
+c.set("shiftId", turno.id);
 
   await next();
 }

@@ -368,11 +368,22 @@ closing.get("/preview/:initialReadingId", requireModule("cierre"), async (c) => 
 // periodo. Se comparte el handler entero en vez de reescribir el cierre aquí, porque
 // dos maneras distintas de cerrar un periodo es exactamente como una de las dos se
 // queda sin conciliar.
-export const confirmarCierreHandler = async (c: Context<{ Bindings: Env }>) => {
+export const confirmarCierreHandler = async (c: Context<{
+  Bindings: Env;
+  // Los rellena prepararCierreDeTurno (shifts.ts) al cerrar el turno. Opcionales
+  // porque en un cierre directo no hay turno y los trae el body?.
+  Variables: { initialReadingId?: string; shiftId?: string };
+}>) => {
   const db = drizzle(c.env.DB, { schema });
   const auth = c.get("auth");
+  // El turno aporta estos dos por CONTEXTO (ver prepararCierreDeTurno en shifts.ts).
+  // Hono cachea el body en el primer `json()`, así que un middleware no puede
+  // inyectar campos reescribiendo `c.req.raw`: el handler recibiría el body
+  // original. Por eso van por `c.set`.
+  const desdeTurno = c.get("initialReadingId") as string | undefined;
+  const shiftDelTurno = c.get("shiftId") as string | undefined;
   const body = await c.req.json<{
-    initialReadingId: string; items: any[]; notes?: string;
+    initialReadingId?: string; items: any[]; notes?: string;
     /** Lo que el cajero contó de dinero, por moneda: {"CUP":1200,"USD":20} */
     countedCash?: Record<string, number>;
     /** La HORA del conteo. Sin conexión puede ser horas anterior a cuando se
@@ -382,9 +393,11 @@ export const confirmarCierreHandler = async (c: Context<{ Bindings: Env }>) => {
      *  lote que el cierre: o se guardan los dos, o no se guarda ninguno. */
     shiftId?: string;
   }>().catch(() => null);
-  if (!body?.initialReadingId) return c.json({ ok: false, error: "initialReadingId es requerido" }, 400);
+  if (!body?.initialReadingId && !desdeTurno) return c.json({ ok: false, error: "initialReadingId es requerido" }, 400);
 
-  const initialReading = await loadInitialReading(db, auth, body.initialReadingId);
+  // La guarda de arriba ya garantiza que hay id del turno o del body?.
+  const initialReading = await loadInitialReading(
+    db, auth, (body?.initialReadingId || desdeTurno) as string);
   if (!initialReading) {
     return c.json({ ok: false, error: "Lectura inicial no encontrada o sin permisos sobre su ubicación" }, 404);
   }
@@ -397,9 +410,10 @@ export const confirmarCierreHandler = async (c: Context<{ Bindings: Env }>) => {
   // la cola sin conexión, el turno sigue abierto y el siguiente cajero puede
   // tomar la caja.
   let turnoACerrar: typeof schema.shifts.$inferSelect | null = null;
-  if (body.shiftId) {
+  const shiftIdEfectivo = body?.shiftId || shiftDelTurno;
+  if (shiftIdEfectivo) {
     turnoACerrar = await db.select().from(schema.shifts).where(and(
-      eq(schema.shifts.id, String(body.shiftId)),
+      eq(schema.shifts.id, shiftIdEfectivo),
       eq(schema.shifts.companyId, auth.companyId),
     )).get() ?? null;
     if (!turnoACerrar) {
@@ -440,7 +454,7 @@ export const confirmarCierreHandler = async (c: Context<{ Bindings: Env }>) => {
   }
 
   // ── Conteo: solo productos de ESTA empresa ───────────────────────────────
-  const submitted = Array.isArray(body.items) ? body.items : [];
+  const submitted = Array.isArray(body?.items) ? body?.items : [];
   const submittedIds: string[] = [];
   for (const it of submitted) {
     const pid = it?.productId;
@@ -479,8 +493,8 @@ export const confirmarCierreHandler = async (c: Context<{ Bindings: Env }>) => {
   //
   // Va aquí y no más abajo porque el fin del período depende de ella: un cierre
   // encolado tiene que cerrar el turno que se contó, no el día que llegó.
-  const countedAt = body.countedAt && Number.isFinite(Date.parse(body.countedAt))
-    ? new Date(body.countedAt)
+  const countedAt = body?.countedAt && Number.isFinite(Date.parse(body?.countedAt))
+    ? new Date(body?.countedAt)
     : new Date();
 
   const periodStart = new Date(initialReading.createdAt!);
@@ -585,7 +599,7 @@ export const confirmarCierreHandler = async (c: Context<{ Bindings: Env }>) => {
     )).get();
   const shiftId = turnoCierre?.id ?? null;
   const baseCash = dinero(turnoCierre?.baseCash);
-  const countedCash = dinero(body.countedCash);
+  const countedCash = dinero(body?.countedCash);
 
   // Si no llega dinero contado, NO se calcula el descuadre. Hay dos caminos
   // que llegan aquí sin dinero: un cliente viejo que no conoce esta pantalla,
@@ -669,7 +683,7 @@ export const confirmarCierreHandler = async (c: Context<{ Bindings: Env }>) => {
       segundos(countedAt),
       quedaAlgo ? segundos(venceProvisional(countedAt, new Date())) : null,
       shiftId,
-      (body.notes || "").trim() || null,
+      (body?.notes || "").trim() || null,
       ahoraEnSegundos()
     ),
 
@@ -1100,7 +1114,7 @@ closing.post("/:id/note", requireModule("cierre"), async (c) => {
   if (!texto) return c.json({ ok: false, error: "Escribe la nota" }, 400);
 
   const items = (closing.items as any[]) || [];
-  const linea = body?.productId ? items.find((i) => i.productId === body.productId) : null;
+  const linea = body?.productId ? items.find((i) => i.productId === body?.productId) : null;
   // Sin productId es una nota general sobre el cierre; con productId, queda
   // atada a la línea, que es donde se va a mirar.
   if (body?.productId && !linea) {
