@@ -804,6 +804,20 @@ export const confirmarCierreHandler = async (c: Context<{ Bindings: Env }>) => {
 
   return c.json({ ok: true, data: closingRecord, conciliacionCadena }, 201);
 };
+// POST /closing/confirm — confirmar el conteo y conciliar la cadena.
+//
+// Esta ruta SE PERDIÓ en la refactorización de 47115cb: al extraer el cuerpo a un
+// handler exportable para reutilizarlo desde /shift/end, se SUSTITUYÓ la ruta
+// por el handler y no se volvió a registrar. El handler siguió exportado y
+// /shift/end siguió consumiéndolo, así que cerrar turno seguía por su camino
+// mientras que los cierres directos se comían un 404. Web y móvil llaman a esta
+// ruta en ambos casos.
+//
+// Va aquí y no junto al handler porque tiene que declararse DESPUÉS de que
+// `confirmarCierreHandler` exista. Sin middleware: `prepararCierreDeTurno` es
+// solo de /shift/end, que ya valida lo suyo antes de llamar al handler.
+closing.post("/confirm", requireModule("cierre"), confirmarCierreHandler);
+
 closing.get("/", requireModule("cierre"), async (c) => {
   const db = drizzle(c.env.DB, { schema });
   const auth = c.get("auth");
